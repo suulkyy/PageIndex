@@ -1,0 +1,12 @@
+[project]
+name = "pageindex"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "litellm>=1.83.14",
+    "openai-agents[litellm]>=0.10.5",
+    "pymupdf>=1.27.2.3",
+    "pypdf2>=3.0.1",
+    "python-dotenv>=1.2.2",
+    "pyyaml>=6.0.3",
+]
