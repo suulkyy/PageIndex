@@ -49,8 +49,10 @@ import argparse
 import asyncio
 import concurrent.futures
 import json
+import logging
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -60,6 +62,41 @@ sys.path.insert(0, str(Path(__file__).parent))
 from pageindex.utils import ConfigLoader, remove_fields
 
 load_dotenv(override=True)
+
+logger = logging.getLogger("retrieve_pageindex")
+
+
+def setup_logging(level: str = "INFO", log_file: str | None = None) -> Path:
+    """Configure root logger with timestamped formatter. Returns log file path."""
+    logs_dir = Path(__file__).parent / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    if log_file:
+        path = Path(log_file).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = logs_dir / f"retrieve_{ts}.log"
+
+    fmt = "%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    formatter = logging.Formatter(fmt, datefmt=datefmt)
+    file_handler = logging.FileHandler(path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler(sys.stderr)
+    stream_handler.setFormatter(formatter)
+    root.addHandler(file_handler)
+    root.addHandler(stream_handler)
+
+    # Quiet noisy libs unless DEBUG
+    if root.level > logging.DEBUG:
+        for noisy in ("httpx", "httpcore", "openai", "asyncio", "LiteLLM"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+    return path
 
 
 # ── Tree helpers ──────────────────────────────────────────────────────────────
@@ -99,6 +136,7 @@ def _find_node_by_id(structure, node_id: str):
 
 def load_documents(folder: Path) -> dict:
     documents = {}
+    logger.info("Loading documents from %s", folder)
     for path in sorted(folder.glob("*.json")):
         if path.name == "_meta.json":
             continue
@@ -106,7 +144,7 @@ def load_documents(folder: Path) -> dict:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except (json.JSONDecodeError, OSError) as e:
-            print(f"Warning: skipping {path.name}: {e}", file=sys.stderr)
+            logger.warning("skipping %s: %s", path.name, e)
             continue
 
         if isinstance(data, list):
@@ -118,11 +156,11 @@ def load_documents(folder: Path) -> dict:
             doc_name = data.get('doc_name') or path.stem
             doc_description = data.get('doc_description') or ""
         else:
-            print(f"Warning: skipping {path.name}: unrecognized JSON shape", file=sys.stderr)
+            logger.warning("skipping %s: unrecognized JSON shape", path.name)
             continue
 
         if not structure:
-            print(f"Warning: skipping {path.name}: no structure found", file=sys.stderr)
+            logger.warning("skipping %s: no structure found", path.name)
             continue
 
         doc_type = _detect_type(structure)
@@ -139,13 +177,18 @@ def load_documents(folder: Path) -> dict:
         else:
             doc['line_count'] = _max_line_num(structure)
         documents[doc_id] = doc
+        size = doc.get('page_count') if doc_type == 'pdf' else doc.get('line_count')
+        unit = "pages" if doc_type == 'pdf' else "lines"
+        logger.info("  loaded %s [%s, %s %s] %s", doc_id, doc_type, size, unit, doc_name)
 
+    logger.info("Loaded %d document(s)", len(documents))
     return documents
 
 
 # ── Local tool implementations ────────────────────────────────────────────────
 
 def tool_list_documents(documents: dict) -> str:
+    logger.info("tool: list_documents()")
     out = []
     for doc_id, doc in documents.items():
         entry = {
@@ -163,8 +206,10 @@ def tool_list_documents(documents: dict) -> str:
 
 
 def tool_get_document(documents: dict, doc_id: str) -> str:
+    logger.info("tool: get_document(doc_id=%s)", doc_id)
     doc = documents.get(doc_id)
     if not doc:
+        logger.warning("  doc_id %s not found", doc_id)
         return json.dumps({'error': f'Document {doc_id} not found'})
     result = {
         'doc_id': doc_id,
@@ -181,19 +226,24 @@ def tool_get_document(documents: dict, doc_id: str) -> str:
 
 
 def tool_get_document_structure(documents: dict, doc_id: str) -> str:
+    logger.info("tool: get_document_structure(doc_id=%s)", doc_id)
     doc = documents.get(doc_id)
     if not doc:
+        logger.warning("  doc_id %s not found", doc_id)
         return json.dumps({'error': f'Document {doc_id} not found'})
     structure_no_text = remove_fields(doc.get('structure', []), fields=['text'])
     return json.dumps(structure_no_text, ensure_ascii=False)
 
 
 def tool_get_node_content(documents: dict, doc_id: str, node_id: str) -> str:
+    logger.info("tool: get_node_content(doc_id=%s, node_id=%s)", doc_id, node_id)
     doc = documents.get(doc_id)
     if not doc:
+        logger.warning("  doc_id %s not found", doc_id)
         return json.dumps({'error': f'Document {doc_id} not found'})
     node = _find_node_by_id(doc.get('structure', []), node_id)
     if not node:
+        logger.warning("  node_id %s not found in %s", node_id, doc_id)
         return json.dumps({'error': f'Node {node_id} not found in {doc_id}'})
     payload = {
         'doc_id': doc_id,
@@ -332,9 +382,9 @@ def query_agent(
 
     provider, bare_model = resolve_provider(model, provider)
     agent_model = _build_agent_model(provider, bare_model, base_url, api_key)
-    print(f"Provider: {provider}  Model: {bare_model}"
-          + (f"  Base URL: {base_url or DEFAULT_BASE_URLS.get(provider, 'default')}"
-             if provider in ("vllm", "ollama") or base_url else ""))
+    resolved_base = base_url or DEFAULT_BASE_URLS.get(provider, "default")
+    logger.info("provider=%s model=%s base_url=%s", provider, bare_model, resolved_base)
+    logger.info("question: %s", question)
 
     @function_tool
     def list_documents() -> str:
@@ -391,17 +441,22 @@ def query_agent(
                     args = getattr(raw, "arguments", "{}")
                     args_str = f"({args})" if verbose else ""
                     print(f"\n[tool call]: {raw.name}{args_str}", flush=True)
+                    logger.info("agent tool_call: %s args=%s", raw.name, args)
                     current_kind = None
-                elif item.type == "tool_call_output_item" and verbose:
-                    if current_kind is not None:
-                        print()
+                elif item.type == "tool_call_output_item":
                     output = str(item.output)
                     preview = output[:200] + "..." if len(output) > 200 else output
-                    print(f"\n[tool call output]: {preview}", flush=True)
-                    current_kind = None
+                    logger.info("agent tool_output: %s", preview)
+                    if verbose:
+                        if current_kind is not None:
+                            print()
+                        print(f"\n[tool call output]: {preview}", flush=True)
+                        current_kind = None
         if current_kind is not None:
             print()
-        return "" if not streamed_run.final_output else str(streamed_run.final_output)
+        final = "" if not streamed_run.final_output else str(streamed_run.final_output)
+        logger.info("agent final answer (%d chars): %s", len(final), final[:500] + ("…" if len(final) > 500 else ""))
+        return final
 
     try:
         asyncio.get_running_loop()
@@ -435,7 +490,16 @@ def main():
                              "VLLM_API_KEY, OLLAMA_API_KEY).")
     parser.add_argument("--verbose", action="store_true",
                         help="Print tool call arguments and output previews.")
+    parser.add_argument("--log-file", default=None,
+                        help="Path to log file (default: ./logs/retrieve_<timestamp>.log).")
+    parser.add_argument("--log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="Log level (default: INFO). DEBUG also enables httpx/openai chatter.")
     args = parser.parse_args()
+
+    log_path = setup_logging(level=args.log_level, log_file=args.log_file)
+    logger.info("=== retrieve_pageindex run start ===")
+    logger.info("log file: %s", log_path)
 
     folder = Path(args.folder).expanduser().resolve()
     if not folder.is_dir():
@@ -473,19 +537,24 @@ def main():
 
     print(f"Question: {args.question}\n")
 
-    answer = query_agent(
-        documents,
-        model,
-        args.question,
-        verbose=args.verbose,
-        provider=args.provider,
-        base_url=base_url,
-        api_key=args.api_key,
-    )
+    try:
+        answer = query_agent(
+            documents,
+            model,
+            args.question,
+            verbose=args.verbose,
+            provider=args.provider,
+            base_url=base_url,
+            api_key=args.api_key,
+        )
+    except Exception:
+        logger.exception("query_agent failed")
+        raise
     print("\n" + "=" * 60)
     print("Final answer:")
     print("=" * 60)
     print(answer)
+    logger.info("=== retrieve_pageindex run end ===")
 
 
 if __name__ == "__main__":
