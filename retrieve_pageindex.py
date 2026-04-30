@@ -446,7 +446,8 @@ def query_agent(
                 elif item.type == "tool_call_output_item":
                     output = str(item.output)
                     preview = output[:200] + "..." if len(output) > 200 else output
-                    logger.info("agent tool_output: %s", preview)
+                    # Log full output to file; keep stdout preview short.
+                    logger.info("agent tool_output (%d chars): %s", len(output), output)
                     if verbose:
                         if current_kind is not None:
                             print()
@@ -455,7 +456,7 @@ def query_agent(
         if current_kind is not None:
             print()
         final = "" if not streamed_run.final_output else str(streamed_run.final_output)
-        logger.info("agent final answer (%d chars): %s", len(final), final[:500] + ("…" if len(final) > 500 else ""))
+        logger.info("agent final answer (%d chars): %s", len(final), final)
         return final
 
     try:
