@@ -93,7 +93,7 @@ def _phase(name: str):
 from pageindex import *  # noqa: E402,F401,F403
 from pageindex.page_index_md import md_to_tree  # noqa: E402
 from pageindex.utils import ConfigLoader  # noqa: E402
-from pageindex import page_index as _page_index_module  # noqa: E402
+from pageindex.page_index import tree_parser as _tree_parser  # noqa: E402
 
 
 def _verbose_page_index_main(doc, opt):
@@ -126,7 +126,7 @@ def _verbose_page_index_main(doc, opt):
 
     async def _build():
         with _phase("Build tree (tree_parser)"):
-            structure = await _page_index_module.tree_parser(page_list, opt, doc=doc, logger=logger)
+            structure = await _tree_parser(page_list, opt, doc=doc, logger=logger)
 
         if opt.if_add_node_id == 'yes':
             with _phase("Assign node_id"):
