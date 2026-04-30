@@ -29,9 +29,31 @@ def count_tokens(text, model=None):
     return litellm.token_counter(model=model, text=text)
 
 
+def _provider_kwargs(model):
+    kwargs = {}
+    if not model:
+        return kwargs
+    if model.startswith(("ollama/", "ollama_chat/")):
+        base = os.getenv("OLLAMA_API_BASE") or os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_HOST")
+        if base:
+            kwargs["api_base"] = base
+        timeout = os.getenv("OLLAMA_TIMEOUT")
+        kwargs["timeout"] = float(timeout) if timeout else 1800.0
+        # Disable reasoning/thinking output for qwen3, deepseek-r1, etc.
+        # Override with OLLAMA_THINK=true if you want it back on.
+        if os.getenv("OLLAMA_THINK", "false").lower() not in ("1", "true", "yes"):
+            kwargs["think"] = False
+    elif model.startswith("vllm/"):
+        base = os.getenv("VLLM_API_BASE") or os.getenv("VLLM_BASE_URL")
+        if base:
+            kwargs["api_base"] = base
+    return kwargs
+
+
 def llm_completion(model, prompt, chat_history=None, return_finish_reason=False):
     if model:
         model = model.removeprefix("litellm/")
+    extra = _provider_kwargs(model)
     max_retries = 10
     messages = list(chat_history) + [{"role": "user", "content": prompt}] if chat_history else [{"role": "user", "content": prompt}]
     for i in range(max_retries):
@@ -40,6 +62,7 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                 model=model,
                 messages=messages,
                 temperature=0,
+                **extra,
             )
             content = response.choices[0].message.content
             if return_finish_reason:
@@ -62,6 +85,7 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
 async def llm_acompletion(model, prompt):
     if model:
         model = model.removeprefix("litellm/")
+    extra = _provider_kwargs(model)
     max_retries = 10
     messages = [{"role": "user", "content": prompt}]
     for i in range(max_retries):
@@ -70,6 +94,7 @@ async def llm_acompletion(model, prompt):
                 model=model,
                 messages=messages,
                 temperature=0,
+                **extra,
             )
             return response.choices[0].message.content
         except Exception as e:
@@ -98,6 +123,14 @@ def get_json_content(response):
 
 def extract_json(content):
     try:
+        if not content:
+            return {}
+        import re as _re
+        # Strip reasoning-model think blocks (qwen3, deepseek-r1, etc.)
+        content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL)
+        content = _re.sub(r"<think>.*", "", content, flags=_re.DOTALL)
+        content = content.strip()
+
         # First, try to extract JSON enclosed within ```json and ```
         start_idx = content.find("```json")
         if start_idx != -1:
@@ -105,8 +138,24 @@ def extract_json(content):
             end_idx = content.rfind("```")
             json_content = content[start_idx:end_idx].strip()
         else:
-            # If no delimiters, assume entire content could be JSON
-            json_content = content.strip()
+            # Prefer first '[' if present (list responses), else first '{'.
+            first_bracket = content.find("[")
+            first_brace = content.find("{")
+            if first_bracket != -1 and (first_brace == -1 or first_bracket < first_brace):
+                start = first_bracket
+            elif first_brace != -1:
+                start = first_brace
+            else:
+                start = 0
+            json_content = content[start:].strip()
+
+        # Use raw_decode to handle "Extra data" — return only first valid JSON value.
+        try:
+            decoder = json.JSONDecoder()
+            value, _ = decoder.raw_decode(json_content)
+            return value
+        except json.JSONDecodeError:
+            pass
 
         # Clean up common issues that might cause parsing errors
         json_content = json_content.replace('None', 'null')  # Replace Python None with JSON null
