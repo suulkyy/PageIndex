@@ -52,14 +52,22 @@ python3 run_pageindex_verbose.py --pdf_path doc.pdf \
 - `OLLAMA_TIMEOUT` — request timeout in seconds (default `1800`).
 - `OLLAMA_THINK` — set `true`/`1`/`yes` to keep reasoning output for qwen3, deepseek-r1, etc. Default off (stripped) so JSON parsers don't choke on `<think>` blocks.
 
-**vLLM** — prefix `vllm/`, point at OpenAI-compatible endpoint:
+**vLLM (HTTP server)** — prefix `hosted_vllm/`, point at OpenAI-compatible endpoint (local or remote host):
 ```bash
+# local
 VLLM_API_BASE=http://localhost:8000/v1 \
 python3 run_pageindex_verbose.py --pdf_path doc.pdf \
-  --model vllm/meta-llama/Llama-3.1-8B-Instruct
+  --model hosted_vllm/meta-llama/Llama-3.1-8B-Instruct
+
+# remote host (e.g. shared GPU box)
+VLLM_API_BASE=http://<VLLM_HOST>:8000/v1 \
+python3 run_pageindex_verbose.py --pdf_path doc.pdf \
+  --model hosted_vllm/Qwen/Qwen3.5-9B
 ```
-- Base URL env: `VLLM_API_BASE` or `VLLM_BASE_URL`. Required if vLLM not on default LiteLLM target.
-- Model string after `vllm/` must match the `--served-model-name` that vLLM serves.
+- Use `hosted_vllm/` (not bare `vllm/`) for HTTP-served vLLM. LiteLLM's `vllm/` prefix invokes offline batching and tries `import vllm` locally — fails with `VLLMException - No module named 'vllm'` when calling a remote server.
+- Base URL env: `VLLM_API_BASE` or `VLLM_BASE_URL`. Required if vLLM not on default LiteLLM target. Set to remote host's `:8000/v1` to use a non-local server.
+- Model string after `hosted_vllm/` must match the `--served-model-name` that vLLM serves (verify via `curl $VLLM_API_BASE/models`).
+- `pageindex/utils.py:_provider_kwargs` accepts both `vllm/` and `hosted_vllm/` for env-driven `api_base` injection.
 
 Outputs land in `./results/` regardless of provider. Scratch dirs `results_ollama/` and `results_vllm/` in repo root are user-managed copies — not auto-populated.
 
@@ -91,16 +99,25 @@ python3 retrieve_pageindex.py --folder ./results --question "..." \
 - API key fallback: `OLLAMA_API_KEY` → literal `"EMPTY"` (Ollama ignores it but `AsyncOpenAI` requires non-empty).
 - Note: this script reads `OLLAMA_BASE_URL` (with `/v1`), **not** `OLLAMA_API_BASE` used by the tree-build path.
 
-**vLLM** — OpenAI-compatible:
+**vLLM** — OpenAI-compatible (local or remote host):
 ```bash
+# local
 VLLM_BASE_URL=http://localhost:8000/v1 \
 python3 retrieve_pageindex.py --folder ./results --question "..." \
   --provider vllm --model meta-llama/Llama-3.1-8B-Instruct
-# or prefix auto-detect:
+
+# remote host
+VLLM_BASE_URL=http://<VLLM_HOST>:8000/v1 \
 python3 retrieve_pageindex.py --folder ./results --question "..." \
-  --model vllm/meta-llama/Llama-3.1-8B-Instruct
+  --provider vllm --model Qwen/Qwen3.5-9B
+
+# or prefix auto-detect (combine with env or --base-url):
+python3 retrieve_pageindex.py --folder ./results --question "..." \
+  --base-url http://<VLLM_HOST>:8000/v1 \
+  --model vllm/Qwen/Qwen3.5-9B
 ```
-- Default `base_url` if unset: `http://localhost:8000/v1`. Override with `--base-url` or `VLLM_BASE_URL`.
+- Default `base_url` if unset: `http://localhost:8000/v1`. Override with `--base-url` or `VLLM_BASE_URL` to point at remote vLLM host.
+- vLLM server must be launched with `--enable-auto-tool-choice` and `--tool-call-parser <parser>` (e.g. `hermes`, `llama3_json`). Without these, the agent's tool calls return `400 - "auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set`.
 - API key fallback: `VLLM_API_KEY` → `"EMPTY"`.
 - Model name must match vLLM's `--served-model-name`.
 
