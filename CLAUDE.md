@@ -70,6 +70,8 @@ python3 run_pageindex_verbose.py --pdf_path doc.pdf \
 - Base URL env: `VLLM_API_BASE` or `VLLM_BASE_URL`. Required if vLLM not on default LiteLLM target. Set to remote host's `:8000/v1` to use a non-local server.
 - Model string after `hosted_vllm/` must match the `--served-model-name` that vLLM serves (verify via `curl $VLLM_API_BASE/models`).
 - `pageindex/utils.py:_provider_kwargs` accepts both `vllm/` and `hosted_vllm/` for env-driven `api_base` injection.
+- `VLLM_TIMEOUT` — request timeout in seconds (default `1800`). LiteLLM's built-in default for `hosted_vllm` is 600s, which times out on slow remote hosts running big-context models (e.g. `litellm.Timeout: Hosted_vllmException - Connection timed out after 600.0 seconds`). Raise via `VLLM_TIMEOUT=3600` etc.
+- `PAGEINDEX_LLM_CONCURRENCY` — max in-flight async LLM calls (default `8`). Tree-build fans out via `asyncio.gather` at `verify_toc`, `check_title_appearance_in_start_concurrent`, `fix_incorrect_toc_with_retries`, `process_large_node_recursively`, and `generate_summaries_for_structure`. Without a cap, a long doc can fire 50+ concurrent requests at vLLM. On a single-GPU vLLM that overflows the GPU KV cache → vLLM preempts running sequences (KV usage observed dropping from ~99% to 0%, `Avg generation throughput` collapses to 0 t/s, requests cycle Running → Waiting). The cap lives in `pageindex/utils.py:_get_llm_sem` and wraps `llm_acompletion`. Raise on multi-GPU/big-VRAM hosts; lower if you still see preemption thrash.
 
 Outputs land in `./results/` regardless of provider. Scratch dirs `results_ollama/` and `results_vllm/` in repo root are user-managed copies — not auto-populated.
 
@@ -120,6 +122,10 @@ python3 retrieve_pageindex.py --folder ./results --question "..." \
 ```
 - Default `base_url` if unset: `http://localhost:8000/v1`. Override with `--base-url` or `VLLM_BASE_URL` to point at remote vLLM host.
 - vLLM server must be launched with `--enable-auto-tool-choice` and `--tool-call-parser <parser>` (e.g. `hermes`, `llama3_json`). Without these, the agent's tool calls return `400 - "auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set`.
+- Long-context KV pressure: agent message history grows every turn (tool outputs accumulate). Two env caps blunt this:
+  - `PAGEINDEX_NODE_TEXT_MAX_CHARS` — truncate `get_node_content` text payload (default `16000`, set `0` to disable). Truncated payload includes `truncated: true`, `original_text_chars`, `truncated_to_chars`.
+  - `PAGEINDEX_AGENT_MAX_TOKENS` — `ModelSettings(max_tokens=…)` cap on per-turn output (default `2048`, set `0` to leave server default). Bounds vLLM's worst-case KV slot allocation.
+  - `PAGEINDEX_AGENT_MAX_TURNS` — `Runner.run_streamed(max_turns=…)` (default `30`, was upstream `100`). Cuts off runaway loops on weak models before history saturates KV.
 - API key fallback: `VLLM_API_KEY` → `"EMPTY"`.
 - Model name must match vLLM's `--served-model-name`.
 
