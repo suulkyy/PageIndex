@@ -33,7 +33,9 @@ python3 run_pageindex_verbose.py --pdf_path doc.pdf [--quiet] [--log-level DEBUG
 Flags specific to the verbose script:
 - `--verbose` / `--quiet` — toggle live stderr progress stream (default ON). `--quiet` keeps phase timing but suppresses per-log-line previews.
 - `--log-level` — python `logging` level (default `WARNING`); raise to `INFO`/`DEBUG` for litellm + asyncio chatter on stderr.
-- `--log-file` — override JsonLogger destination (default `./logs/<sanitized_doc_name>.log`).
+- `--log-file` — override tee destination (default `./logs/run_<YYYYMMDD_HHMMSS>.log`). Pass `none` to disable. Both `sys.stdout` and `sys.stderr` are tee'd into this file, so the upstream `print(...)` calls (`Parsing PDF...`, TOC mode/accuracy chatter, final save line) and any tracebacks land in the log alongside the streamed JsonLogger previews. Bare lines get a `[YYYY-MM-DD HH:MM:SS.mmm]` prefix in the file copy; lines that already start with a timestamp (logger format, phase markers) pass through unchanged so timestamps don't double up. Terminal output is not modified.
+
+The verbose script delegates the actual pipeline to upstream `pageindex.page_index.page_index_main` (PDF) and `pageindex.page_index_md.md_to_tree` (MD) — same return shape, key ordering, and branching as `run_pageindex.py`. Verbose adds only: JsonLogger monkey-patch (live stderr previews), `_phase` timer around the whole PDF/MD pipeline + save, and the stdout/stderr tee.
 All other flags match `run_pageindex.py`.
 
 Common flags (all override `pageindex/config.yaml`): `--model`, `--toc-check-pages`, `--max-pages-per-node`, `--max-tokens-per-node`, `--if-add-node-id yes|no`, `--if-add-node-summary`, `--if-add-doc-description`, `--if-add-node-text`. Markdown-only: `--if-thinning`, `--thinning-threshold`, `--summary-token-threshold`.
@@ -80,7 +82,7 @@ python3 retrieve_pageindex.py --folder ./results --question "..."
 # prefix model with ollama/, vllm/, openai/, litellm/ for auto-detect
 python3 retrieve_pageindex.py --folder ./results --question "..." --provider ollama --model llama3.1:8b
 ```
-Logs: `./logs/retrieve_<ts>.log` (`--log-file` to override). `--verbose` prints tool args + output previews.
+Logs: `./logs/retrieve_<YYYYMMDD_HHMMSS>.log` (`--log-file` to override). Both `sys.stdout` and `sys.stderr` are tee'd into this file, so the agent's streamed reasoning, tool-call/tool-output prints, final answer, and any tracebacks all land in the log. Bare lines get a `[YYYY-MM-DD HH:MM:SS.mmm]` prefix in the file copy; logger lines (already formatted with asctime) pass through unchanged. `--verbose` prints tool args + output previews.
 
 #### Running retrieval with custom Ollama / vLLM models
 
@@ -173,7 +175,7 @@ All LLM calls go through `llm_completion` / `llm_acompletion` — both wrap Lite
 Loads `*.json` from a folder, infers PDF vs MD per-file by node fields (`start_index` → pdf, `line_num` → md), exposes `list_documents` / `get_document` / `get_document_structure` / `get_node_content` to an `openai-agents` `Agent`. `resolve_provider` strips known prefixes; `_build_agent_model` constructs an `AsyncOpenAI` client + `OpenAIChatCompletionsModel` for vllm/ollama (Chat Completions, not Responses API). Streams reasoning + tool calls live; falls back to `asyncio.run` in a worker thread when called from inside an existing loop.
 
 ### Logging (`pageindex/utils.py:JsonLogger`)
-Per-document JSON-line logger writing to `./logs/<sanitized_doc_name>.log`. `run_pageindex_verbose.py` monkey-patches it to also emit single-line stderr previews and times each phase.
+Per-document JSON-line logger writing to `./logs/<sanitized_doc_name>.log`. `run_pageindex_verbose.py` monkey-patches it to also emit single-line stderr previews, then tees both `sys.stdout` and `sys.stderr` into a separate timestamped tee log (`./logs/run_<YYYYMMDD_HHMMSS>.log`) so all upstream prints + tracebacks are captured. The tee adds `[YYYY-MM-DD HH:MM:SS.mmm]` per bare line in the file copy; lines that already begin with a timestamp pattern pass through unchanged. `retrieve_pageindex.py` does the same stdout+stderr tee into `./logs/retrieve_<YYYYMMDD_HHMMSS>.log`, with a single `StreamHandler` pointed at the (already-tee'd) `sys.stderr` — there's no separate `FileHandler`, so logger lines reach the file via the tee and never double-write.
 
 ## Conventions worth knowing
 
