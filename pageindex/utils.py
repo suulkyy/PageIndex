@@ -43,7 +43,7 @@ def _provider_kwargs(model):
         # Override with OLLAMA_THINK=true if you want it back on.
         if os.getenv("OLLAMA_THINK", "false").lower() not in ("1", "true", "yes"):
             kwargs["think"] = False
-    elif model.startswith("vllm/"):
+    elif model.startswith(("vllm/", "hosted_vllm/")):
         base = os.getenv("VLLM_API_BASE") or os.getenv("VLLM_BASE_URL")
         if base:
             kwargs["api_base"] = base
