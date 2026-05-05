@@ -23,6 +23,34 @@ if not os.getenv("OPENAI_API_KEY") and os.getenv("CHATGPT_API_KEY"):
 
 litellm.drop_params = True
 
+
+# ── Concurrency cap for LLM calls ─────────────────────────────────────────────
+# Tree-build fans out LLM calls via asyncio.gather (verify_toc, summary
+# generation, title-appearance checks, recursive node processing). Without
+# a cap, a long doc can fire 50+ concurrent requests at the LLM. On a
+# single-GPU vLLM that overflows the KV cache: vLLM preempts running
+# sequences, throughput collapses to 0 t/s, and requests cycle Running →
+# Waiting → Running. Bound concurrency to a safe default and let the user
+# raise it via env when they have headroom.
+_LLM_SEM = None
+_LLM_SEM_LOOP = None
+
+
+def _get_llm_sem():
+    """Lazy per-loop asyncio.Semaphore. Re-create when running under a
+    different event loop (tests, nested asyncio.run)."""
+    global _LLM_SEM, _LLM_SEM_LOOP
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if _LLM_SEM is None or _LLM_SEM_LOOP is not loop:
+        n = int(os.getenv("PAGEINDEX_LLM_CONCURRENCY", "8"))
+        _LLM_SEM = asyncio.Semaphore(max(1, n))
+        _LLM_SEM_LOOP = loop
+    return _LLM_SEM
+
+
 def count_tokens(text, model=None):
     if not text:
         return 0
@@ -47,6 +75,11 @@ def _provider_kwargs(model):
         base = os.getenv("VLLM_API_BASE") or os.getenv("VLLM_BASE_URL")
         if base:
             kwargs["api_base"] = base
+        # LiteLLM default for hosted_vllm is 600s, which times out on slow
+        # remote vLLM hosts running big-context models. Mirror the ollama
+        # pattern: 1800s default, override with VLLM_TIMEOUT.
+        timeout = os.getenv("VLLM_TIMEOUT")
+        kwargs["timeout"] = float(timeout) if timeout else 1800.0
     return kwargs
 
 
@@ -88,23 +121,25 @@ async def llm_acompletion(model, prompt):
     extra = _provider_kwargs(model)
     max_retries = 10
     messages = [{"role": "user", "content": prompt}]
-    for i in range(max_retries):
-        try:
-            response = await litellm.acompletion(
-                model=model,
-                messages=messages,
-                temperature=0,
-                **extra,
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print('************* Retrying *************')
-            logging.error(f"Error: {e}")
-            if i < max_retries - 1:
-                await asyncio.sleep(1)
-            else:
-                logging.error('Max retries reached for prompt: ' + prompt)
-                return ""
+    sem = _get_llm_sem()
+    async with sem:
+        for i in range(max_retries):
+            try:
+                response = await litellm.acompletion(
+                    model=model,
+                    messages=messages,
+                    temperature=0,
+                    **extra,
+                )
+                return response.choices[0].message.content
+            except Exception as e:
+                print('************* Retrying *************')
+                logging.error(f"Error: {e}")
+                if i < max_retries - 1:
+                    await asyncio.sleep(1)
+                else:
+                    logging.error('Max retries reached for prompt: ' + prompt)
+                    return ""
             
             
 def get_json_content(response):
