@@ -5,24 +5,29 @@ Same CLI as run_pageindex.py, plus:
   --verbose / --quiet     toggle live progress stream (default: verbose ON)
   --log-level             python logging level for litellm/asyncio chatter
 
-Live progress is written to stderr so stdout stays clean (the final save line
-still prints to stdout). Internally this:
-  1. Wraps `pageindex.utils.JsonLogger` so every `.info` / `.error` call also
-     emits a single-line summary to stderr (the original JSON file under
-     ./logs/ is still written).
-  2. Times each top-level phase: PDF parse, tree_parser, post-processing,
-     summary generation, doc description, save.
-  3. Forwards the existing scattered `print(...)` statements unchanged (they
-     already announce TOC detection, mode selection, accuracy, retries, etc.).
+Delegates the actual pipeline to the upstream `page_index_main` /
+`md_to_tree` so behavior stays identical to `run_pageindex.py`. Verbose
+overlay is purely observational:
+  1. Wraps `pageindex.utils.JsonLogger` so every `.info` / `.error` call
+     also emits a single-line summary to stderr (the original JSON file
+     under ./logs/ is still written).
+  2. Times each top-level phase: PDF/MD pipeline + save.
+  3. Forwards the existing scattered `print(...)` statements unchanged
+     (they already announce TOC detection, mode selection, accuracy,
+     retries, etc.).
+  4. Optionally tees the stderr stream to a log file under ./logs/.
 """
 import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime
+
+_TS_RE = re.compile(r"^\[?\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
 
 # Wire stderr logging early so any module-level logging calls during import
 # are captured.
@@ -57,21 +62,44 @@ def _ts():
 
 
 class _Tee:
-    """Mirror writes to stderr and an open log file."""
+    """Mirror writes to a stream + log file. Prepends timestamps in the file
+    copy for any line that doesn't already start with one. Terminal copy
+    stays untouched."""
     def __init__(self, stream, file_obj):
         self._stream = stream
         self._file = file_obj
+        self._pending = ""
     def write(self, data):
-        self._stream.write(data)
         try:
-            self._file.write(data)
+            self._stream.write(data)
+        except Exception:
+            pass
+        try:
+            buf = self._pending + (data or "")
+            while True:
+                idx = buf.find("\n")
+                if idx == -1:
+                    self._pending = buf
+                    break
+                line = buf[:idx]
+                buf = buf[idx + 1:]
+                if line and not _TS_RE.match(line):
+                    self._file.write(f"[{_ts()}] {line}\n")
+                else:
+                    self._file.write(line + "\n")
             self._file.flush()
         except Exception:
             pass
         return len(data) if isinstance(data, str) else 0
     def flush(self):
-        self._stream.flush()
         try:
+            self._stream.flush()
+        except Exception:
+            pass
+        try:
+            if self._pending:
+                self._file.write(self._pending)
+                self._pending = ""
             self._file.flush()
         except Exception:
             pass
@@ -84,14 +112,15 @@ class _Tee:
 
 
 def _setup_log_file(path):
-    """Tee stderr to log file. Reconfigure root logging so prior handlers
-    inherit the new sys.stderr. Returns resolved Path."""
+    """Tee BOTH stdout and stderr to log file. Reconfigure root logging so
+    prior handlers inherit the new sys.stderr. Returns resolved Path."""
     from pathlib import Path as _Path
     p = _Path(path).expanduser().resolve()
     p.parent.mkdir(parents=True, exist_ok=True)
     f = open(p, "a", encoding="utf-8", buffering=1)
     f.write(f"\n[{_ts()}] === log start: {p} ===\n")
     sys.stderr = _Tee(sys.stderr, f)
+    sys.stdout = _Tee(sys.stdout, f)
     # Rewire any existing StreamHandler to new sys.stderr.
     for h in list(logging.getLogger().handlers):
         if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
@@ -139,81 +168,9 @@ def _phase(name: str):
 # ── Patched page_index_main / md_to_tree wrappers ─────────────────────────────
 
 from pageindex import *  # noqa: E402,F401,F403
+from pageindex.page_index import page_index_main as _page_index_main  # noqa: E402
 from pageindex.page_index_md import md_to_tree  # noqa: E402
 from pageindex.utils import ConfigLoader  # noqa: E402
-from pageindex.page_index import tree_parser as _tree_parser  # noqa: E402
-
-
-def _verbose_page_index_main(doc, opt):
-    """Mirror pageindex.page_index.page_index_main with per-phase timing.
-    Keep this pipeline aligned with page_index_main when upstream changes.
-    """
-    import asyncio
-    from io import BytesIO
-    from pageindex.utils import (
-        get_page_tokens, write_node_id, add_node_text,
-        generate_summaries_for_structure, remove_structure_text,
-        generate_doc_description, format_structure, get_pdf_name,
-        create_clean_structure_for_description,
-    )
-
-    logger = _VerboseJsonLogger(doc)
-
-    is_valid_pdf = (
-        (isinstance(doc, str) and os.path.isfile(doc) and doc.lower().endswith(".pdf"))
-        or isinstance(doc, BytesIO)
-    )
-    if not is_valid_pdf:
-        raise ValueError("Unsupported input type. Expected a PDF file path or BytesIO object.")
-
-    with _phase("Parse PDF + tokenize pages"):
-        page_list = get_page_tokens(doc, model=opt.model)
-        total_tokens = sum(p[1] for p in page_list)
-        logger.info({'total_page_number': len(page_list)})
-        logger.info({'total_token': total_tokens})
-        if _VERBOSE:
-            print(f"[{_ts()}]   pages={len(page_list)}  tokens={total_tokens}", file=sys.stderr, flush=True)
-
-    _ORDER = ['title', 'node_id', 'start_index', 'end_index', 'summary', 'text', 'nodes']
-
-    async def _build():
-        with _phase("Build tree (tree_parser)"):
-            structure = await _tree_parser(page_list, opt, doc=doc, logger=logger)
-
-        if opt.if_add_node_id == 'yes':
-            with _phase("Assign node_id"):
-                write_node_id(structure)
-
-        if opt.if_add_node_text == 'yes':
-            with _phase("Attach node text"):
-                add_node_text(structure, page_list)
-
-        doc_description = None
-        if opt.if_add_node_summary == 'yes':
-            with _phase("Generate node summaries"):
-                if opt.if_add_node_text == 'no':
-                    add_node_text(structure, page_list)
-                await generate_summaries_for_structure(structure, model=opt.model)
-                if opt.if_add_node_text == 'no':
-                    remove_structure_text(structure)
-            if opt.if_add_doc_description == 'yes':
-                with _phase("Generate doc description"):
-                    clean_structure = create_clean_structure_for_description(structure)
-                    doc_description = generate_doc_description(clean_structure, model=opt.model)
-
-        with _phase("Format structure"):
-            structure = format_structure(structure, order=_ORDER)
-
-        result = {'doc_name': get_pdf_name(doc), 'structure': structure}
-        if doc_description is not None:
-            result['doc_description'] = doc_description
-            # Match upstream key ordering: doc_name, doc_description, structure
-            result = {'doc_name': result['doc_name'],
-                      'doc_description': doc_description,
-                      'structure': structure}
-        return result
-
-    return asyncio.run(_build())
 
 
 # ── CLI (mirrors run_pageindex.py) ────────────────────────────────────────────
@@ -299,7 +256,7 @@ def main():
             print(f"[{_ts()}] [config] {vars(opt)}", file=sys.stderr, flush=True)
 
         with _phase(f"PDF pipeline: {args.pdf_path}"):
-            result = _verbose_page_index_main(args.pdf_path, opt)
+            result = _page_index_main(args.pdf_path, opt)
 
         pdf_name = os.path.splitext(os.path.basename(args.pdf_path))[0]
         output_dir = './results'
