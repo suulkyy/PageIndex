@@ -330,6 +330,20 @@ def tool_get_node_content(documents: dict, doc_id: str, node_id: str) -> str:
         payload['text'] = ''
         payload['source'] = 'none'
         payload['note'] = 'Neither text nor summary available for this node.'
+
+    # Cap returned text so the agent's growing message history doesn't push
+    # vLLM/Ollama past the KV cache budget on long sessions or huge nodes.
+    # Override via PAGEINDEX_NODE_TEXT_MAX_CHARS=0 to disable, or any int
+    # to set a custom cap.
+    cap = int(os.getenv("PAGEINDEX_NODE_TEXT_MAX_CHARS", "16000"))
+    if cap > 0 and isinstance(payload.get('text'), str) and len(payload['text']) > cap:
+        original = len(payload['text'])
+        payload['text'] = payload['text'][:cap]
+        payload['truncated'] = True
+        payload['original_text_chars'] = original
+        payload['truncated_to_chars'] = cap
+        payload.setdefault('note',
+            f"Text truncated to {cap} chars (original {original}). Adjust PAGEINDEX_NODE_TEXT_MAX_CHARS to change.")
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -470,15 +484,30 @@ def query_agent(
         """Get the full text of a specific node by its node_id."""
         return tool_get_node_content(documents, doc_id, node_id)
 
-    agent = Agent(
+    # Bound output tokens per turn so vLLM/Ollama don't allocate worst-case
+    # KV slots for runaway generations. Overridable via env. 0 = unset
+    # (server default). Mainly relevant for local servers.
+    _max_out = int(os.getenv("PAGEINDEX_AGENT_MAX_TOKENS", "2048"))
+    agent_kwargs = dict(
         name="PageIndexLocal",
         instructions=AGENT_SYSTEM_PROMPT,
         tools=[list_documents, get_document, get_document_structure, get_node_content],
         model=agent_model,
     )
+    if _max_out > 0:
+        try:
+            from agents import ModelSettings
+            agent_kwargs["model_settings"] = ModelSettings(max_tokens=_max_out)
+        except ImportError:
+            logger.warning("agents.ModelSettings not available; max_tokens cap skipped")
+    agent = Agent(**agent_kwargs)
 
     async def _run():
-        streamed_run = Runner.run_streamed(agent, question, max_turns=100)
+        # Cap agent loop length. Long loops blow up the rolling message
+        # history, which is what eventually saturates vLLM's KV cache on
+        # local hosts.
+        _max_turns = int(os.getenv("PAGEINDEX_AGENT_MAX_TURNS", "30"))
+        streamed_run = Runner.run_streamed(agent, question, max_turns=_max_turns)
         current_kind = None
         async for event in streamed_run.stream_events():
             if isinstance(event, RawResponsesStreamEvent):
