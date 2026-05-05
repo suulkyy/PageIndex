@@ -51,6 +51,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -65,9 +66,67 @@ load_dotenv(override=True)
 
 logger = logging.getLogger("retrieve_pageindex")
 
+_TS_RE = re.compile(r"^\[?\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
+
+
+def _ts():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+class _Tee:
+    """Mirror writes to a stream + log file. Prepends timestamps in the file
+    copy for lines that don't already start with one. Terminal copy
+    untouched."""
+    def __init__(self, stream, file_obj):
+        self._stream = stream
+        self._file = file_obj
+        self._pending = ""
+    def write(self, data):
+        try:
+            self._stream.write(data)
+        except Exception:
+            pass
+        try:
+            buf = self._pending + (data or "")
+            while True:
+                idx = buf.find("\n")
+                if idx == -1:
+                    self._pending = buf
+                    break
+                line = buf[:idx]
+                buf = buf[idx + 1:]
+                if line and not _TS_RE.match(line):
+                    self._file.write(f"[{_ts()}] {line}\n")
+                else:
+                    self._file.write(line + "\n")
+            self._file.flush()
+        except Exception:
+            pass
+        return len(data) if isinstance(data, str) else 0
+    def flush(self):
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+        try:
+            if self._pending:
+                self._file.write(self._pending)
+                self._pending = ""
+            self._file.flush()
+        except Exception:
+            pass
+    def isatty(self):
+        return getattr(self._stream, "isatty", lambda: False)()
+    def fileno(self):
+        return self._stream.fileno()
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
 
 def setup_logging(level: str = "INFO", log_file: str | None = None) -> Path:
-    """Configure root logger with timestamped formatter. Returns log file path."""
+    """Configure root logger with timestamped formatter. Tee stdout+stderr
+    into the same log file so bare print() and tracebacks land there too.
+    Returns resolved log file path."""
     logs_dir = Path(__file__).parent / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     if log_file:
@@ -77,6 +136,11 @@ def setup_logging(level: str = "INFO", log_file: str | None = None) -> Path:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = logs_dir / f"retrieve_{ts}.log"
 
+    f = open(path, "a", encoding="utf-8", buffering=1)
+    f.write(f"\n[{_ts()}] === log start: {path} ===\n")
+    sys.stdout = _Tee(sys.stdout, f)
+    sys.stderr = _Tee(sys.stderr, f)
+
     fmt = "%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
     root = logging.getLogger()
@@ -85,11 +149,11 @@ def setup_logging(level: str = "INFO", log_file: str | None = None) -> Path:
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
 
     formatter = logging.Formatter(fmt, datefmt=datefmt)
-    file_handler = logging.FileHandler(path, encoding="utf-8")
-    file_handler.setFormatter(formatter)
+    # Single StreamHandler pointed at the (already-teed) sys.stderr —
+    # logger lines reach the file via the tee, no separate FileHandler so
+    # nothing double-writes.
     stream_handler = logging.StreamHandler(sys.stderr)
     stream_handler.setFormatter(formatter)
-    root.addHandler(file_handler)
     root.addHandler(stream_handler)
 
     # Quiet noisy libs unless DEBUG
