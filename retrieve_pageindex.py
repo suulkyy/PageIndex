@@ -415,7 +415,7 @@ TOOL USE:
 - Call get_document_structure(doc_id) to inspect the compact tree and pick the most relevant node_id(s).
 - Call get_node_content(doc_id, node_id) to read a node's full text. Prefer leaf nodes; expand to parents only if needed.
 - Before each tool call, output one short sentence explaining the reason.
-Answer based only on tool output. Be concise and cite the doc_id and node_id you used.
+Answer based only on tool output. Give a thorough, well-structured answer that explains the key evidence, important caveats, and how the cited evidence supports the conclusion. Cite the doc_id and node_id for each major claim.
 When ready to answer, either write normal assistant text or call answer(answer=...).
 Do not call answer before using the document tools needed for evidence.
 """
@@ -631,12 +631,12 @@ def query_agent(
 
     @function_tool
     def answer(answer: str) -> str:
-        """Return the final answer to the user after document evidence has been gathered."""
+        """Return a thorough final answer to the user after document evidence has been gathered."""
         return answer
 
     answer_thinking = _env_truthy("PAGEINDEX_RETRIEVE_ENABLE_THINKING", False)
     if provider == "vllm" and "PAGEINDEX_AGENT_MAX_TOKENS" not in os.environ:
-        default_max_tokens = 8192 if answer_thinking else 1024
+        default_max_tokens = 8192 if answer_thinking else 2048
     else:
         default_max_tokens = 2048
 
