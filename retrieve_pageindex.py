@@ -416,6 +416,8 @@ TOOL USE:
 - Call get_node_content(doc_id, node_id) to read a node's full text. Prefer leaf nodes; expand to parents only if needed.
 - Before each tool call, output one short sentence explaining the reason.
 Answer based only on tool output. Be concise and cite the doc_id and node_id you used.
+When ready to answer, either write normal assistant text or call answer(answer=...).
+Do not call answer before using the document tools needed for evidence.
 """
 
 
@@ -627,6 +629,11 @@ def query_agent(
         """Get the full text of a specific node by its node_id."""
         return tool_get_node_content(documents, doc_id, node_id)
 
+    @function_tool
+    def answer(answer: str) -> str:
+        """Return the final answer to the user after document evidence has been gathered."""
+        return answer
+
     answer_thinking = _env_truthy("PAGEINDEX_RETRIEVE_ENABLE_THINKING", False)
     if provider == "vllm" and "PAGEINDEX_AGENT_MAX_TOKENS" not in os.environ:
         default_max_tokens = 8192 if answer_thinking else 1024
@@ -653,7 +660,8 @@ def query_agent(
     agent_kwargs = dict(
         name="PageIndexLocal",
         instructions=AGENT_SYSTEM_PROMPT,
-        tools=[list_documents, get_document, get_document_structure, get_node_content],
+        tools=[list_documents, get_document, get_document_structure, get_node_content, answer],
+        tool_use_behavior={"stop_at_tool_names": ["answer"]},
         model=agent_model,
     )
     if _max_out > 0 or extra_body:
@@ -662,6 +670,7 @@ def query_agent(
             settings = {}
             if _max_out > 0:
                 settings["max_tokens"] = _max_out
+            settings["parallel_tool_calls"] = False
             if extra_body:
                 settings["extra_body"] = extra_body
             agent_kwargs["model_settings"] = ModelSettings(**settings)
