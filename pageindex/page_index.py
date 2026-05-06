@@ -71,6 +71,30 @@ async def check_title_appearance_in_start(title, page_text, model=None, logger=N
     return response.get("start_begin", "no")
 
 
+def _normalize_for_title_match(text):
+    text = text or ""
+    for src, dst in _TOC_NOISE_REPLACEMENTS.items():
+        text = text.replace(src, dst)
+    text = text.lower()
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def check_title_appearance_in_start_heuristic(title, page_text):
+    """Cheap local check: does the (normalized) title appear near the top
+    of the page? Returns 'yes'/'no' when confident, or None when the
+    heuristic can't decide and the LLM should be consulted."""
+    title_norm = _normalize_for_title_match(title)
+    if not title_norm:
+        return None
+    prefix_norm = _normalize_for_title_match((page_text or "")[:1500])
+    if not prefix_norm:
+        return None
+    pos = prefix_norm.find(title_norm)
+    if pos == -1:
+        return None
+    return "yes" if pos <= 160 else "no"
+
+
 async def check_title_appearance_in_start_concurrent(structure, page_list, model=None, logger=None):
     if logger:
         logger.info("Checking title appearance in start concurrently")
@@ -83,11 +107,19 @@ async def check_title_appearance_in_start_concurrent(structure, page_list, model
     # only for items with valid physical_index
     tasks = []
     valid_items = []
+    heuristic_count = 0
     for item in structure:
         if item.get('physical_index') is not None:
             page_text = page_list[item['physical_index'] - 1][0]
-            tasks.append(check_title_appearance_in_start(item['title'], page_text, model=model, logger=logger))
-            valid_items.append(item)
+            heuristic_answer = check_title_appearance_in_start_heuristic(item['title'], page_text)
+            if heuristic_answer is not None:
+                item['appear_start'] = heuristic_answer
+                heuristic_count += 1
+            else:
+                tasks.append(check_title_appearance_in_start(item['title'], page_text, model=model, logger=logger))
+                valid_items.append(item)
+    if logger:
+        logger.info(f"title start heuristic resolved {heuristic_count}; llm fallback {len(tasks)}")
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for item, result in zip(valid_items, results):
@@ -270,70 +302,224 @@ def toc_index_extractor(toc, content, model=None):
 
 
 
-def toc_transformer(toc_content, model=None):
-    print('start toc_transformer')
-    init_prompt = """
-    You are given a table of contents, You job is to transform the whole table of content into a JSON format included table_of_contents.
+# Ligature characters that PyPDF2/pymupdf often emit verbatim. Map back to
+# ASCII so substring/title matching against the rendered page text works.
+_TOC_NOISE_REPLACEMENTS = {
+    "\ufb00": "ff",
+    "\ufb01": "fi",
+    "\ufb02": "fl",
+    "\ufb03": "ffi",
+    "\ufb04": "ffl",
+}
 
-    structure is the numeric system which represents the index of the hierarchy section in the table of contents. For example, the first section has structure index 1, the first subsection has structure index 1.1, the second subsection has structure index 1.2, etc.
 
-    The response should be in the following JSON format: 
-    {
-    table_of_contents: [
-        {
-            "structure": <structure index, "x.x.x" or None> (string),
-            "title": <title of the section>,
-            "page": <page number or None>,
-        },
-        ...
-        ],
+def _normalize_toc_text(text):
+    for src, dst in _TOC_NOISE_REPLACEMENTS.items():
+        text = text.replace(src, dst)
+    # Common PDF extraction issue: one TOC entry is glued to the next one.
+    text = re.sub(r"(?<=[0-9ivxlcdm])(?=Appendix\s+[A-Z]\b)", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<=[0-9ivxlcdm])(?=References\b)", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<=[0-9ivxlcdm])(?=Index\b)", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<=[0-9ivxlcdm])(?=Contents\s+[ivxlcdm]+\b)", "\n", text, flags=re.IGNORECASE)
+    return text
+
+
+def _strip_toc_line_noise(line):
+    line = line.strip()
+    line = re.sub(r"(?<=\d)[ivxlcdm]+\s*CONTENTS\b", "", line, flags=re.IGNORECASE)
+    line = re.sub(r"\b[ivxlcdm]+\s*CONTENTS\b", "", line, flags=re.IGNORECASE)
+    line = re.sub(r"\s*CONTENTS\s+[ivxlcdm]+\b", "", line, flags=re.IGNORECASE)
+    line = re.sub(r"\s+", " ", line)
+    return line.strip()
+
+
+def _normalize_toc_title(title):
+    title = re.sub(r"(?:\s*\.\s*){2,}", " ", title)
+    title = re.sub(r"\s*:\s*$", "", title)
+    title = re.sub(r"\s+", " ", title).strip(" .:")
+    # PDF extraction often splits a leading capital from the rest: "V ariables".
+    title = re.sub(r"\b([A-Z])\s+([a-z][a-z]+)\b", r"\1\2", title)
+    return title
+
+
+def _normalize_toc_page(page_text):
+    page_text = page_text.strip().replace(" ", "")
+    if page_text.isdigit():
+        return int(page_text)
+    # Roman front-matter pages do not share the Arabic-page offset.
+    if re.fullmatch(r"[ivxlcdm]+", page_text, flags=re.IGNORECASE):
+        return None
+    return None
+
+
+def _toc_entry_from_match(match, current_chapter, front_matter_index):
+    head = match.group("head").strip()
+    title = _normalize_toc_title(match.group("title") or "")
+    page = _normalize_toc_page(match.group("page"))
+    lower_head = head.lower()
+
+    if re.fullmatch(r"\d+(?:\.\d+)*", head):
+        structure = head
+        if "." not in head:
+            current_chapter = head
+        title = title or head
+    elif lower_head.startswith("appendix"):
+        letter = head.split()[-1]
+        structure = letter
+        title = _normalize_toc_title(f"{head} {title}")
+    elif lower_head == "exercises":
+        structure = f"{current_chapter}.exercises" if current_chapter else None
+        title = "Exercises"
+    elif lower_head in ("references", "index"):
+        structure = lower_head
+        title = head.title()
+    else:
+        front_matter_index += 1
+        structure = f"0.{front_matter_index}"
+        title = _normalize_toc_title(f"{head} {title}")
+
+    return {
+        "item": {"structure": structure, "title": title, "page": page},
+        "current_chapter": current_chapter,
+        "front_matter_index": front_matter_index,
     }
-    You should transform the full table of contents in one go.
-    Directly return the final JSON structure, do not output anything else. """
 
-    prompt = init_prompt + '\n Given table of contents\n:' + toc_content
-    last_complete, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
-    if_complete = check_if_toc_transformation_is_complete(toc_content, last_complete, model)
-    if if_complete == "yes" and finish_reason == "finished":
-        last_complete = extract_json(last_complete)
-        cleaned_response=convert_page_to_int(last_complete['table_of_contents'])
-        return cleaned_response
-    
-    last_complete = get_json_content(last_complete)
-    attempt = 0
-    max_attempts = 5
-    while not (if_complete == "yes" and finish_reason == "finished"):
-        attempt += 1
-        if attempt > max_attempts:
-            raise Exception('Failed to complete toc transformation after maximum retries')
-        position = last_complete.rfind('}')
-        if position != -1:
-            last_complete = last_complete[:position+2]
-        prompt = f"""
-        Your task is to continue the table of contents json structure, directly output the remaining part of the json structure.
-        The response should be in the following JSON format: 
 
-        The raw table of contents json structure is:
-        {toc_content}
+def _parse_toc_line_heuristic(line, current_chapter, front_matter_index):
+    entry_pattern = re.compile(
+        r"^(?P<head>\d+(?:\.\d+)*|Appendix\s+[A-Z]|Exercises|References|Index|Preface|Mathematical notation)\b"
+        r"\s*(?P<title>.*?)\s*(?:[:.]\s*)?(?P<page>(?:\d\s*){1,5}|[ivxlcdm]+)\s*$",
+        flags=re.IGNORECASE,
+    )
+    match = entry_pattern.match(line)
+    if not match:
+        return None
+    parsed = _toc_entry_from_match(match, current_chapter, front_matter_index)
+    item = parsed["item"]
+    if not item["title"] or item["title"].lower().startswith("contents"):
+        return None
+    return parsed
 
-        The incomplete transformed table of contents json structure is:
-        {last_complete}
 
-        Please continue the json structure, directly output the remaining part of the json structure."""
+def parse_toc_content_heuristic(toc_content):
+    """Deterministic line-by-line TOC parser. Returns (items, stats) where
+    items is a list of `{structure, title, page}` dicts and stats reports
+    confidence = items/candidates. `toc_transformer` skips the LLM step
+    when items >= 8 and confidence >= 0.65 — handles textbook-scale TOCs
+    (e.g. PRML.pdf) without sending tens of pages to an LLM."""
+    text = _normalize_toc_text(toc_content)
+    items = []
+    current_chapter = None
+    front_matter_index = 0
+    candidate_count = 0
 
-        new_complete, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
+    for raw_line in text.splitlines():
+        line = _strip_toc_line_noise(raw_line)
+        if not line or line.lower().startswith("contents"):
+            continue
+        if re.fullmatch(r"[ivxlcdm]+", line, flags=re.IGNORECASE):
+            continue
 
-        if new_complete.startswith('```json'):
-            new_complete =  get_json_content(new_complete)
-            last_complete = last_complete+new_complete
+        if re.search(r"(?:\d\s*){1,5}$|[ivxlcdm]+$", line, flags=re.IGNORECASE):
+            candidate_count += 1
 
-        if_complete = check_if_toc_transformation_is_complete(toc_content, last_complete, model)
-        
+        parsed = _parse_toc_line_heuristic(line, current_chapter, front_matter_index)
+        if not parsed:
+            continue
+        current_chapter = parsed["current_chapter"]
+        front_matter_index = parsed["front_matter_index"]
+        items.append(parsed["item"])
 
-    last_complete = extract_json(last_complete)
+    confidence = len(items) / candidate_count if candidate_count else 0
+    stats = {
+        "items": len(items),
+        "candidates": candidate_count,
+        "confidence": round(confidence, 3),
+    }
+    return items, stats
 
-    cleaned_response=convert_page_to_int(last_complete['table_of_contents'])
-    return cleaned_response
+
+def _toc_chunks(toc_content, model=None):
+    """Split a long TOC into chunks of ≤ `toc_chunk_max_tokens` lines so
+    each chunk can be transformed by an LLM call without overflowing
+    `max-model-len`. Used as the chunked LLM fallback when
+    `parse_toc_content_heuristic` lacks confidence."""
+    max_tokens = get_llm_runtime_int(
+        "toc_chunk_max_tokens",
+        ("PAGEINDEX_TOC_CHUNK_MAX_TOKENS",),
+        6000,
+    )
+    lines = [_strip_toc_line_noise(line) for line in _normalize_toc_text(toc_content).splitlines()]
+    lines = [line for line in lines if line]
+    chunks = []
+    current = []
+
+    for line in lines:
+        candidate = "\n".join(current + [line])
+        try:
+            token_count = count_tokens(candidate, model=model)
+        except Exception:
+            token_count = len(candidate) // 4
+        if current and token_count > max_tokens:
+            chunks.append("\n".join(current))
+            current = [line]
+        else:
+            current.append(line)
+
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [toc_content]
+
+
+def _transform_toc_chunk_with_llm(toc_content, model=None, logger=None):
+    prompt = """
+    You are given a table of contents. Transform it into JSON.
+
+    Return only a JSON array. Each item must be:
+    {
+      "structure": <section index such as "1", "1.2", "A", or null>,
+      "title": <section title>,
+      "page": <printed page number as integer, or null>
+    }
+
+    Preserve all entries in the given table of contents. Do not output prose.
+    Table of contents:
+    """ + toc_content
+
+    response, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
+    items = _finish_toc_json(prompt, response, finish_reason, model=model, logger=logger)
+    if isinstance(items, dict) and isinstance(items.get("table_of_contents"), list):
+        items = items["table_of_contents"]
+    if not isinstance(items, list):
+        items = []
+    return convert_page_to_int(items)
+
+
+def toc_transformer(toc_content, model=None, logger=None):
+    """Turn raw TOC text into JSON items. Tries the deterministic
+    heuristic first; falls back to a chunk-by-chunk LLM transform with
+    `_finish_toc_json` continuation when the heuristic isn't confident."""
+    print('start toc_transformer')
+    heuristic_items, stats = parse_toc_content_heuristic(toc_content)
+    if logger:
+        logger.info(f'toc heuristic stats: {stats}')
+    if stats["items"] >= 8 and stats["confidence"] >= 0.65:
+        if logger:
+            logger.info(f'toc_transformer using heuristic parser with {stats["items"]} items')
+        return convert_page_to_int(heuristic_items)
+
+    chunks = _toc_chunks(toc_content, model=model)
+    if logger:
+        logger.info(f'toc_transformer using chunked LLM fallback with {len(chunks)} chunks')
+
+    transformed = []
+    for chunk in chunks:
+        chunk_items = _transform_toc_chunk_with_llm(chunk, model=model, logger=logger)
+        transformed = _merge_toc_items(transformed, chunk_items)
+
+    if transformed:
+        return convert_page_to_int(transformed)
+    raise Exception('Failed to complete toc transformation after maximum retries')
     
 
 
@@ -368,6 +554,7 @@ def find_toc_pages(start_page_index, page_list, opt, logger=None):
 def remove_page_number(data):
     if isinstance(data, dict):
         data.pop('page_number', None)  
+        data.pop('page', None)
         for key in list(data.keys()):
             if 'nodes' in key:
                 remove_page_number(data[key])
@@ -422,8 +609,63 @@ def add_page_offset_to_toc_json(data, offset):
     return data
 
 
+def guess_page_offset_from_toc(toc_items, toc_page_list):
+    """Cheap deterministic offset guess: the first content page is
+    typically TOC-end + 2 (one blank page after the TOC). Map that
+    physical index back to the printed page number on the first
+    body-section TOC item to derive the offset. Skips front-matter
+    items (structure starts with '0.') and roman-page entries.
+    Returns None when the heuristic can't decide; callers fall back
+    to `calculate_page_offset` over LLM-matched pairs."""
+    if not toc_items or not toc_page_list:
+        return None
+    first_content_physical_index = toc_page_list[-1] + 2
+    for item in toc_items:
+        page = item.get("page")
+        structure = item.get("structure")
+        if not isinstance(page, int) or page <= 0:
+            continue
+        if isinstance(structure, str) and structure.startswith("0."):
+            continue
+        offset = first_content_physical_index - page
+        return offset if offset >= 0 else None
+    return None
 
-def page_list_to_group_text(page_contents, token_lengths, max_tokens=20000, overlap_page=1):    
+
+def _default_group_max_tokens(model=None):
+    """Compute the page-group token budget based on the active server's
+    context window. For vllm/hosted_vllm we subtract the per-call output
+    cap, the chat-template safety margin, and a fixed prompt overhead so
+    the assembled prompt + JSON output fits in `max-model-len`. Falls
+    back to the upstream 20 k default for OpenAI/Anthropic-class models
+    where context is large enough to be a non-issue."""
+    normalized_model = model.removeprefix("litellm/") if model else ""
+    if not normalized_model.startswith(("vllm/", "hosted_vllm/")):
+        return 20000
+
+    model_len = get_llm_runtime_int("vllm_max_model_len", ("VLLM_MAX_MODEL_LEN",), 16384)
+    output_cap = get_llm_runtime_int("vllm_max_tokens", ("VLLM_MAX_TOKENS",), 2048)
+    if output_cap <= 0:
+        output_cap = 2048
+    margin = get_llm_runtime_int("vllm_ctx_margin", ("VLLM_CTX_MARGIN",), 256)
+    prompt_overhead = get_llm_runtime_int(
+        "pageindex_group_prompt_overhead",
+        ("PAGEINDEX_GROUP_PROMPT_OVERHEAD",),
+        1600,
+    )
+    available = model_len - output_cap - margin - prompt_overhead
+    return max(2000, min(available, model_len // 2, 10000))
+
+
+def page_list_to_group_text(page_contents, token_lengths, max_tokens=None, overlap_page=1, model=None):
+    # Upstream default targets GPT-4 (128k context). Local vLLM servers often
+    # run at 16k/32k, so use a smaller default unless explicitly overridden.
+    if max_tokens is None:
+        max_tokens = get_llm_runtime_int(
+            "pageindex_group_max_tokens",
+            ("PAGEINDEX_GROUP_MAX_TOKENS",),
+            0,
+        ) or _default_group_max_tokens(model)
     num_tokens = sum(token_lengths)
     
     if num_tokens <= max_tokens:
@@ -439,7 +681,7 @@ def page_list_to_group_text(page_contents, token_lengths, max_tokens=20000, over
     average_tokens_per_part = math.ceil(((num_tokens / expected_parts_num) + max_tokens) / 2)
     
     for i, (page_content, page_tokens) in enumerate(zip(page_contents, token_lengths)):
-        if current_token_count + page_tokens > average_tokens_per_part:
+        if current_subset and current_token_count + page_tokens > average_tokens_per_part:
 
             subsets.append(''.join(current_subset))
             # Start new subset from overlap if specified
@@ -503,8 +745,135 @@ def remove_first_physical_index_section(text):
         return text.replace(match.group(0), '', 1)
     return text
 
+
+def _extract_complete_toc_items(content):
+    """Salvage every fully-formed JSON object from a possibly-truncated
+    LLM response. Used when generation hit `max_output_reached` mid-array
+    — returns whatever objects parsed cleanly so `_finish_toc_json` can
+    re-prompt for the rest instead of throwing the whole call away."""
+    if not content:
+        return []
+
+    cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+    cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL).strip()
+    if cleaned.startswith("```"):
+        cleaned = get_json_content(cleaned)
+
+    decoder = json.JSONDecoder()
+    try:
+        parsed, _ = decoder.raw_decode(cleaned)
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, dict)]
+        if isinstance(parsed, dict) and isinstance(parsed.get("table_of_contents"), list):
+            return [item for item in parsed["table_of_contents"] if isinstance(item, dict)]
+    except json.JSONDecodeError:
+        pass
+
+    items = []
+    idx = 0
+    while idx < len(cleaned):
+        obj_start = cleaned.find("{", idx)
+        if obj_start == -1:
+            break
+        try:
+            value, offset = decoder.raw_decode(cleaned[obj_start:])
+        except json.JSONDecodeError:
+            idx = obj_start + 1
+            continue
+        if isinstance(value, dict):
+            if isinstance(value.get("table_of_contents"), list):
+                items.extend(item for item in value["table_of_contents"] if isinstance(item, dict))
+            else:
+                items.append(value)
+        idx = obj_start + max(offset, 1)
+    return items
+
+
+def _merge_toc_items(existing, new_items):
+    """Append new TOC entries while deduplicating by
+    (structure, title, physical_index, page) — guards against the model
+    repeating already-emitted entries during a continuation re-prompt."""
+    merged = list(existing)
+    seen = {
+        (
+            str(item.get("structure")),
+            str(item.get("title")),
+            str(item.get("physical_index")),
+            str(item.get("page")),
+        )
+        for item in merged
+        if isinstance(item, dict)
+    }
+    for item in new_items:
+        if not isinstance(item, dict):
+            continue
+        key = (
+            str(item.get("structure")),
+            str(item.get("title")),
+            str(item.get("physical_index")),
+            str(item.get("page")),
+        )
+        if key not in seen:
+            merged.append(item)
+            seen.add(key)
+    return merged
+
+
+def _finish_toc_json(prompt, response, finish_reason, model=None, logger=None, max_attempts=3):
+    """Recover from `finish_reason=length` on TOC-generation calls. Salvage
+    complete objects from the truncated buffer, then re-prompt the model
+    (with the prior turn replayed in chat_history) up to `max_attempts`
+    times asking it to continue without repeating. Replaces the older
+    behavior of raising on truncation and losing all prior work."""
+    items = _extract_complete_toc_items(response)
+    if finish_reason == 'finished':
+        return items if items else extract_json(response)
+
+    if finish_reason != 'max_output_reached':
+        raise Exception(f'finish reason: {finish_reason}')
+
+    if logger:
+        logger.info(f'TOC generation hit max output; recovered {len(items)} complete items')
+
+    chat_history = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": response},
+    ]
+    for _ in range(max_attempts):
+        last_item = items[-1] if items else None
+        continue_prompt = f"""
+        Continue extracting the same table-of-contents JSON.
+        Return only a JSON array of remaining complete objects.
+        Do not repeat any objects already returned.
+        Last complete object already kept:
+        {json.dumps(last_item, ensure_ascii=False)}
+        """
+        response, finish_reason = llm_completion(
+            model=model,
+            prompt=continue_prompt,
+            chat_history=chat_history,
+            return_finish_reason=True,
+        )
+        new_items = _extract_complete_toc_items(response)
+        items = _merge_toc_items(items, new_items)
+        chat_history.extend([
+            {"role": "user", "content": continue_prompt},
+            {"role": "assistant", "content": response},
+        ])
+        if logger:
+            logger.info(f'TOC continuation finish_reason={finish_reason}; total recovered items={len(items)}')
+        if finish_reason == 'finished':
+            break
+        if finish_reason != 'max_output_reached' or not response:
+            break
+
+    if items:
+        return items
+    raise Exception(f'finish reason: {finish_reason}')
+
+
 ### add verify completeness
-def generate_toc_continue(toc_content, part, model=None):
+def generate_toc_continue(toc_content, part, model=None, logger=None):
     print('start generate_toc_continue')
     prompt = """
     You are an expert in extracting hierarchical tree structure.
@@ -533,13 +902,10 @@ def generate_toc_continue(toc_content, part, model=None):
 
     prompt = prompt + '\nGiven text\n:' + part + '\nPrevious tree structure\n:' + json.dumps(toc_content, indent=2)
     response, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
-    if finish_reason == 'finished':
-        return extract_json(response)
-    else:
-        raise Exception(f'finish reason: {finish_reason}')
+    return _finish_toc_json(prompt, response, finish_reason, model=model, logger=logger)
     
 ### add verify completeness
-def generate_toc_init(part, model=None):
+def generate_toc_init(part, model=None, logger=None):
     print('start generate_toc_init')
     prompt = """
     You are an expert in extracting hierarchical tree structure, your task is to generate the tree structure of the document.
@@ -567,11 +933,7 @@ def generate_toc_init(part, model=None):
 
     prompt = prompt + '\nGiven text\n:' + part
     response, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
-
-    if finish_reason == 'finished':
-         return extract_json(response)
-    else:
-        raise Exception(f'finish reason: {finish_reason}')
+    return _finish_toc_json(prompt, response, finish_reason, model=model, logger=logger)
 
 def process_no_toc(page_list, start_index=1, model=None, logger=None):
     page_contents=[]
@@ -580,14 +942,14 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None):
         page_text = f"<physical_index_{page_index}>\n{page_list[page_index-start_index][0]}\n<physical_index_{page_index}>\n\n"
         page_contents.append(page_text)
         token_lengths.append(count_tokens(page_text, model))
-    group_texts = page_list_to_group_text(page_contents, token_lengths)
+    group_texts = page_list_to_group_text(page_contents, token_lengths, model=model)
     logger.info(f'len(group_texts): {len(group_texts)}')
 
-    toc_with_page_number = generate_toc_init(group_texts[0], model)
+    toc_with_page_number = generate_toc_init(group_texts[0], model, logger=logger)
     if not isinstance(toc_with_page_number, list):
         toc_with_page_number = []
     for group_text in group_texts[1:]:
-        toc_with_page_number_additional = generate_toc_continue(toc_with_page_number, group_text, model)
+        toc_with_page_number_additional = generate_toc_continue(toc_with_page_number, group_text, model, logger=logger)
         if isinstance(toc_with_page_number_additional, list):
             toc_with_page_number.extend(toc_with_page_number_additional)
     logger.info(f'generate_toc: {toc_with_page_number}')
@@ -600,14 +962,14 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None):
 def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_index=1, model=None, logger=None):
     page_contents=[]
     token_lengths=[]
-    toc_content = toc_transformer(toc_content, model)
+    toc_content = toc_transformer(toc_content, model, logger=logger)
     logger.info(f'toc_transformer: {toc_content}')
     for page_index in range(start_index, start_index+len(page_list)):
         page_text = f"<physical_index_{page_index}>\n{page_list[page_index-start_index][0]}\n<physical_index_{page_index}>\n\n"
         page_contents.append(page_text)
         token_lengths.append(count_tokens(page_text, model))
     
-    group_texts = page_list_to_group_text(page_contents, token_lengths)
+    group_texts = page_list_to_group_text(page_contents, token_lengths, model=model)
     logger.info(f'len(group_texts): {len(group_texts)}')
 
     toc_with_page_number=copy.deepcopy(toc_content)
@@ -623,27 +985,32 @@ def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_in
 
 
 def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_check_page_num=None, model=None, logger=None):
-    toc_with_page_number = toc_transformer(toc_content, model)
+    toc_with_page_number = toc_transformer(toc_content, model, logger=logger)
     logger.info(f'toc_with_page_number: {toc_with_page_number}')
 
-    toc_no_page_number = remove_page_number(copy.deepcopy(toc_with_page_number))
-    
-    start_page_index = toc_page_list[-1] + 1
-    main_content = ""
-    for page_index in range(start_page_index, min(start_page_index + toc_check_page_num, len(page_list))):
-        main_content += f"<physical_index_{page_index+1}>\n{page_list[page_index][0]}\n<physical_index_{page_index+1}>\n\n"
+    offset = guess_page_offset_from_toc(toc_with_page_number, toc_page_list)
+    logger.info(f'offset guess from toc: {offset}')
+    if offset is None:
+        toc_no_page_number = remove_page_number(copy.deepcopy(toc_with_page_number))
 
-    toc_with_physical_index = toc_index_extractor(toc_no_page_number, main_content, model)
-    logger.info(f'toc_with_physical_index: {toc_with_physical_index}')
+        start_page_index = toc_page_list[-1] + 1
+        main_content = ""
+        for page_index in range(start_page_index, min(start_page_index + toc_check_page_num, len(page_list))):
+            main_content += f"<physical_index_{page_index+1}>\n{page_list[page_index][0]}\n<physical_index_{page_index+1}>\n\n"
 
-    toc_with_physical_index = convert_physical_index_to_int(toc_with_physical_index)
-    logger.info(f'toc_with_physical_index: {toc_with_physical_index}')
+        toc_with_physical_index = toc_index_extractor(toc_no_page_number, main_content, model)
+        logger.info(f'toc_with_physical_index: {toc_with_physical_index}')
 
-    matching_pairs = extract_matching_page_pairs(toc_with_page_number, toc_with_physical_index, start_page_index)
-    logger.info(f'matching_pairs: {matching_pairs}')
+        toc_with_physical_index = convert_physical_index_to_int(toc_with_physical_index)
+        logger.info(f'toc_with_physical_index: {toc_with_physical_index}')
 
-    offset = calculate_page_offset(matching_pairs)
-    logger.info(f'offset: {offset}')
+        matching_pairs = extract_matching_page_pairs(toc_with_page_number, toc_with_physical_index, start_page_index)
+        logger.info(f'matching_pairs: {matching_pairs}')
+
+        offset = calculate_page_offset(matching_pairs)
+        logger.info(f'offset: {offset}')
+    if offset is None:
+        raise Exception('Failed to infer page offset from table of contents')
 
     toc_with_page_number = add_page_offset_to_toc_json(toc_with_page_number, offset)
     logger.info(f'toc_with_page_number: {toc_with_page_number}')
@@ -659,6 +1026,9 @@ def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_che
 def process_none_page_numbers(toc_items, page_list, start_index=1, model=None):
     for i, item in enumerate(toc_items):
         if "physical_index" not in item:
+            if item.get("page") is None:
+                item["physical_index"] = None
+                continue
             # logger.info(f"fix item: {item}")
             # Find previous physical_index
             prev_physical_index = 0  # Default if no previous item exists
@@ -979,7 +1349,16 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
         logger=logger
     )
     
-    accuracy, incorrect_results = await verify_toc(page_list, toc_with_page_number, start_index=start_index, model=opt.model)
+    verify_sample_num = getattr(opt, 'toc_verify_sample_num', None)
+    if verify_sample_num is not None and verify_sample_num <= 0:
+        verify_sample_num = None
+    accuracy, incorrect_results = await verify_toc(
+        page_list,
+        toc_with_page_number,
+        start_index=start_index,
+        N=verify_sample_num,
+        model=opt.model,
+    )
         
     logger.info({
         'mode': 'process_toc_with_page_numbers',
@@ -1113,7 +1492,7 @@ def page_index_main(doc, opt=None):
     return asyncio.run(page_index_builder())
 
 
-def page_index(doc, model=None, toc_check_page_num=None, max_page_num_each_node=None, max_token_num_each_node=None,
+def page_index(doc, model=None, toc_check_page_num=None, toc_verify_sample_num=None, max_page_num_each_node=None, max_token_num_each_node=None,
                if_add_node_id=None, if_add_node_summary=None, if_add_doc_description=None, if_add_node_text=None):
     
     user_opt = {
