@@ -29,6 +29,17 @@ from datetime import datetime
 
 _TS_RE = re.compile(r"^\[?\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
 
+# ── Force instruct (non-thinking) mode for tree-build ─────────────────────────
+# Tree-build issues hundreds of small JSON-only LLM calls. A Qwen3 thinking
+# trace per call multiplies wall-clock 2-4×. Even when the user enables
+# `--reasoning-parser qwen3` + `VLLM_ENABLE_THINKING=true` server/global-side
+# (typically for retrieve_pageindex.py), we hard-pin tree-build to
+# instruct/non-thinking mode here BEFORE pageindex.utils reads the env in
+# `_provider_kwargs`. Override has to happen pre-import so the default takes
+# effect; we also re-assert after import for safety.
+os.environ["VLLM_ENABLE_THINKING"] = "false"
+os.environ["OLLAMA_THINK"] = "false"
+
 # Wire stderr logging early so any module-level logging calls during import
 # are captured.
 _LOG_FORMAT = "[%(asctime)s] %(levelname)s %(name)s: %(message)s"
@@ -37,6 +48,12 @@ logging.basicConfig(level=logging.WARNING, stream=sys.stderr, format=_LOG_FORMAT
 # ── Verbose JsonLogger wrapper ────────────────────────────────────────────────
 
 import pageindex.utils as _pi_utils  # noqa: E402
+
+# Re-assert in case caller exported a different value before `python` ran;
+# `_provider_kwargs` reads os.getenv at every call, so this sticks for the
+# whole tree-build pipeline.
+os.environ["VLLM_ENABLE_THINKING"] = "false"
+os.environ["OLLAMA_THINK"] = "false"
 
 _OriginalJsonLogger = _pi_utils.JsonLogger
 _VERBOSE = True  # toggled by CLI
@@ -170,7 +187,7 @@ def _phase(name: str):
 from pageindex import *  # noqa: E402,F401,F403
 from pageindex.page_index import page_index_main as _page_index_main  # noqa: E402
 from pageindex.page_index_md import md_to_tree  # noqa: E402
-from pageindex.utils import ConfigLoader  # noqa: E402
+from pageindex.utils import ConfigLoader, configure_llm_runtime  # noqa: E402
 
 
 # ── CLI (mirrors run_pageindex.py) ────────────────────────────────────────────
@@ -183,9 +200,29 @@ def main():
     parser.add_argument('--md_path', type=str, help='Path to the Markdown file')
 
     parser.add_argument('--model', type=str, default=None, help='Model to use (overrides config.yaml)')
+    parser.add_argument('--base-url', type=str, default=None,
+                        help='Base URL for hosted vLLM/Ollama-compatible servers')
+    parser.add_argument('--vllm-max-model-len', type=int, default=None,
+                        help='Server max model length for vLLM/hosted_vllm')
+    parser.add_argument('--vllm-max-tokens', type=int, default=None,
+                        help='Per-request output cap for vLLM/hosted_vllm; 0 leaves server default')
+    parser.add_argument('--vllm-timeout', type=float, default=None,
+                        help='Request timeout for vLLM/hosted_vllm')
+    parser.add_argument('--vllm-ctx-margin', type=int, default=None,
+                        help='Context safety margin for vLLM max_tokens clamping')
+    parser.add_argument('--llm-concurrency', type=int, default=None,
+                        help='Max in-flight async LLM calls')
+    parser.add_argument('--group-max-tokens', type=int, default=None,
+                        help='Max tokens per no-TOC page group')
+    parser.add_argument('--group-prompt-overhead', type=int, default=None,
+                        help='Prompt reserve used when sizing no-TOC page groups')
+    parser.add_argument('--toc-chunk-max-tokens', type=int, default=None,
+                        help='Max tokens per chunk for LLM TOC transformation fallback')
 
     parser.add_argument('--toc-check-pages', type=int, default=None,
                         help='Number of pages to check for table of contents (PDF only)')
+    parser.add_argument('--toc-verify-sample', type=int, default=None,
+                        help='Number of TOC entries to verify; 0 checks all (PDF only)')
     parser.add_argument('--max-pages-per-node', type=int, default=None,
                         help='Maximum number of pages per node (PDF only)')
     parser.add_argument('--max-tokens-per-node', type=int, default=None,
@@ -214,6 +251,21 @@ def main():
                         help='Tee stderr stream to this file. Default: ./logs/run_<ts>.log. '
                              'Pass "none" to disable.')
     args = parser.parse_args()
+    # Seed _LLM_RUNTIME from CLI args before any pipeline call; helpers in
+    # pageindex.utils / pageindex.page_index pick up these values via
+    # `get_llm_runtime_value` and fall back to env vars when None.
+    configure_llm_runtime(
+        vllm_base_url=args.base_url,
+        ollama_base_url=args.base_url,
+        vllm_max_model_len=args.vllm_max_model_len,
+        vllm_max_tokens=args.vllm_max_tokens,
+        vllm_timeout=args.vllm_timeout,
+        vllm_ctx_margin=args.vllm_ctx_margin,
+        llm_concurrency=args.llm_concurrency,
+        pageindex_group_max_tokens=args.group_max_tokens,
+        pageindex_group_prompt_overhead=args.group_prompt_overhead,
+        toc_chunk_max_tokens=args.toc_chunk_max_tokens,
+    )
 
     global _VERBOSE
     _VERBOSE = args.verbose
@@ -243,6 +295,7 @@ def main():
         user_opt = {
             'model': args.model,
             'toc_check_page_num': args.toc_check_pages,
+            'toc_verify_sample_num': args.toc_verify_sample,
             'max_page_num_each_node': args.max_pages_per_node,
             'max_token_num_each_node': args.max_tokens_per_node,
             'if_add_node_id': args.if_add_node_id,
