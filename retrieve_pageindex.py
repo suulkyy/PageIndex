@@ -34,6 +34,10 @@ Env fallbacks:
                                        8192 when thinking retrieval is enabled.
     PAGEINDEX_RETRIEVE_THINKING_EVIDENCE_MAX_CHARS
                                        Evidence cap for final thinking pass.
+    PAGEINDEX_STRUCTURE_SUMMARY_MAX_CHARS
+                                       Per-node summary preview in structure tool.
+                                       Default 160; 0 removes summaries.
+    PAGEINDEX_NODE_TEXT_MAX_CHARS      Cap text returned by get_node_content().
 
 Each JSON in --folder must be a tree produced by run_pageindex.py / page_index_main,
 i.e. of shape {"doc_name": ..., "doc_description"?: ..., "structure": [...]}.
@@ -65,7 +69,7 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from pageindex.utils import ConfigLoader, remove_fields
+from pageindex.utils import ConfigLoader
 
 load_dotenv(override=True)
 
@@ -201,6 +205,45 @@ def _find_node_by_id(structure, node_id: str):
     return None
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _truncate_text(value: str | None, max_chars: int) -> str | None:
+    if not isinstance(value, str):
+        return value
+    if max_chars <= 0:
+        return None
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars].rstrip() + "..."
+
+
+def _compact_structure_for_tool(structure, summary_max_chars: int):
+    """Return a navigation-sized tree. Full summaries across large books can
+    exceed local vLLM context before the agent gets to request node text."""
+    compact = []
+    for node in structure or []:
+        item = {
+            'title': node.get('title', ''),
+            'node_id': node.get('node_id'),
+        }
+        for key in ('start_index', 'end_index', 'line_num'):
+            if node.get(key) is not None:
+                item[key] = node.get(key)
+        summary = _truncate_text(node.get('summary'), summary_max_chars)
+        if summary:
+            item['summary'] = summary
+        children = _compact_structure_for_tool(node.get('nodes') or [], summary_max_chars)
+        if children:
+            item['nodes'] = children
+        compact.append(item)
+    return compact
+
+
 # ── Document loading ──────────────────────────────────────────────────────────
 
 def load_documents(folder: Path) -> dict:
@@ -300,8 +343,18 @@ def tool_get_document_structure(documents: dict, doc_id: str) -> str:
     if not doc:
         logger.warning("  doc_id %s not found", doc_id)
         return json.dumps({'error': f'Document {doc_id} not found'})
-    structure_no_text = remove_fields(doc.get('structure', []), fields=['text'])
-    return json.dumps(structure_no_text, ensure_ascii=False)
+    summary_cap = _env_int("PAGEINDEX_STRUCTURE_SUMMARY_MAX_CHARS", 160)
+    structure = _compact_structure_for_tool(doc.get('structure', []), summary_cap)
+    payload = {
+        'doc_id': doc_id,
+        'note': (
+            "Compact structure: node text omitted. Use get_node_content(doc_id, node_id) "
+            "for the selected node."
+        ),
+        'summary_max_chars': summary_cap,
+        'structure': structure,
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def tool_get_node_content(documents: dict, doc_id: str, node_id: str) -> str:
@@ -340,7 +393,7 @@ def tool_get_node_content(documents: dict, doc_id: str, node_id: str) -> str:
     # vLLM/Ollama past the KV cache budget on long sessions or huge nodes.
     # Override via PAGEINDEX_NODE_TEXT_MAX_CHARS=0 to disable, or any int
     # to set a custom cap.
-    cap = int(os.getenv("PAGEINDEX_NODE_TEXT_MAX_CHARS", "16000"))
+    cap = _env_int("PAGEINDEX_NODE_TEXT_MAX_CHARS", 8000)
     if cap > 0 and isinstance(payload.get('text'), str) and len(payload['text']) > cap:
         original = len(payload['text'])
         payload['text'] = payload['text'][:cap]
@@ -359,7 +412,7 @@ You are PageIndex, a local document QA assistant.
 TOOL USE:
 - Call list_documents() first to discover available docs.
 - Call get_document(doc_id) to confirm metadata.
-- Call get_document_structure(doc_id) to inspect the tree and pick the most relevant node_id(s) (use titles + summaries).
+- Call get_document_structure(doc_id) to inspect the compact tree and pick the most relevant node_id(s).
 - Call get_node_content(doc_id, node_id) to read a node's full text. Prefer leaf nodes; expand to parents only if needed.
 - Before each tool call, output one short sentence explaining the reason.
 Answer based only on tool output. Be concise and cite the doc_id and node_id you used.
@@ -575,8 +628,8 @@ def query_agent(
         return tool_get_node_content(documents, doc_id, node_id)
 
     answer_thinking = _env_truthy("PAGEINDEX_RETRIEVE_ENABLE_THINKING", False)
-    if provider == "vllm" and answer_thinking and "PAGEINDEX_AGENT_MAX_TOKENS" not in os.environ:
-        default_max_tokens = 8192
+    if provider == "vllm" and "PAGEINDEX_AGENT_MAX_TOKENS" not in os.environ:
+        default_max_tokens = 8192 if answer_thinking else 1024
     else:
         default_max_tokens = 2048
 
@@ -656,7 +709,11 @@ def query_agent(
                     tool_outputs_for_refine.append(output)
                     preview = output[:200] + "..." if len(output) > 200 else output
                     # Log full output to file; keep stdout preview short.
-                    logger.info("agent tool_output (%d chars): %s", len(output), output)
+                    log_cap = _env_int("PAGEINDEX_TOOL_LOG_MAX_CHARS", 4000)
+                    logged_output = output if log_cap <= 0 else output[:log_cap]
+                    if log_cap > 0 and len(output) > log_cap:
+                        logged_output += f"... [truncated from {len(output)} chars]"
+                    logger.info("agent tool_output (%d chars): %s", len(output), logged_output)
                     if verbose:
                         if current_kind is not None:
                             print()
