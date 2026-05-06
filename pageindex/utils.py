@@ -34,6 +34,56 @@ litellm.drop_params = True
 # raise it via env when they have headroom.
 _LLM_SEM = None
 _LLM_SEM_LOOP = None
+# Per-process registry seeded by `configure_llm_runtime(**kwargs)` from CLI
+# scripts. Read by `_provider_kwargs`, `_resolve_max_tokens`, `_get_llm_sem`,
+# and `page_list_to_group_text` via `get_llm_runtime_value`. CLI args win;
+# env vars are fallbacks.
+_LLM_RUNTIME = {}
+
+
+def configure_llm_runtime(**kwargs):
+    """Set per-process LLM runtime options from CLI/API callers.
+
+    Environment variables remain as backward-compatible fallbacks, but scripts
+    should prefer passing explicit CLI arguments and calling this helper.
+    """
+    global _LLM_SEM, _LLM_SEM_LOOP
+    changed_concurrency = False
+    for key, value in kwargs.items():
+        if value is None:
+            continue
+        _LLM_RUNTIME[key] = value
+        if key == "llm_concurrency":
+            changed_concurrency = True
+    if changed_concurrency:
+        _LLM_SEM = None
+        _LLM_SEM_LOOP = None
+
+
+def get_llm_runtime_value(name, env_names=(), default=None):
+    if name in _LLM_RUNTIME:
+        return _LLM_RUNTIME[name]
+    for env_name in env_names:
+        value = os.getenv(env_name)
+        if value is not None:
+            return value
+    return default
+
+
+def get_llm_runtime_int(name, env_names=(), default=0):
+    value = get_llm_runtime_value(name, env_names, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def get_llm_runtime_float(name, env_names=(), default=0.0):
+    value = get_llm_runtime_value(name, env_names, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _get_llm_sem():
@@ -45,7 +95,7 @@ def _get_llm_sem():
     except RuntimeError:
         loop = None
     if _LLM_SEM is None or _LLM_SEM_LOOP is not loop:
-        n = int(os.getenv("PAGEINDEX_LLM_CONCURRENCY", "8"))
+        n = get_llm_runtime_int("llm_concurrency", ("PAGEINDEX_LLM_CONCURRENCY",), 8)
         _LLM_SEM = asyncio.Semaphore(max(1, n))
         _LLM_SEM_LOOP = loop
     return _LLM_SEM
@@ -62,25 +112,92 @@ def _provider_kwargs(model):
     if not model:
         return kwargs
     if model.startswith(("ollama/", "ollama_chat/")):
-        base = os.getenv("OLLAMA_API_BASE") or os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_HOST")
+        base = get_llm_runtime_value(
+            "ollama_base_url",
+            ("OLLAMA_API_BASE", "OLLAMA_BASE_URL", "OLLAMA_HOST"),
+        )
         if base:
             kwargs["api_base"] = base
-        timeout = os.getenv("OLLAMA_TIMEOUT")
-        kwargs["timeout"] = float(timeout) if timeout else 1800.0
+        timeout = get_llm_runtime_float("ollama_timeout", ("OLLAMA_TIMEOUT",), 1800.0)
+        kwargs["timeout"] = timeout
         # Disable reasoning/thinking output for qwen3, deepseek-r1, etc.
         # Override with OLLAMA_THINK=true if you want it back on.
         if os.getenv("OLLAMA_THINK", "false").lower() not in ("1", "true", "yes"):
             kwargs["think"] = False
     elif model.startswith(("vllm/", "hosted_vllm/")):
-        base = os.getenv("VLLM_API_BASE") or os.getenv("VLLM_BASE_URL")
+        base = get_llm_runtime_value(
+            "vllm_base_url",
+            ("VLLM_API_BASE", "VLLM_BASE_URL"),
+        )
         if base:
             kwargs["api_base"] = base
         # LiteLLM default for hosted_vllm is 600s, which times out on slow
         # remote vLLM hosts running big-context models. Mirror the ollama
         # pattern: 1800s default, override with VLLM_TIMEOUT.
-        timeout = os.getenv("VLLM_TIMEOUT")
-        kwargs["timeout"] = float(timeout) if timeout else 1800.0
+        timeout = get_llm_runtime_float("vllm_timeout", ("VLLM_TIMEOUT",), 1800.0)
+        kwargs["timeout"] = timeout
+        # max_tokens injected dynamically per-call via _resolve_max_tokens()
+        # below — needs prompt size to clamp under server's max-model-len.
+        # Disable Qwen3-family chat-template thinking by default. Qwen3
+        # tokenizer's chat template defaults to enable_thinking=True, so
+        # the model emits <think>...</think>JSON. If max_tokens truncates
+        # mid-think, the open-ended <think>.* fallback in extract_json
+        # wipes everything → empty content → "Expecting value: line 1
+        # column 1". Forcing enable_thinking=False keeps tokens in JSON.
+        # Set VLLM_ENABLE_THINKING=true to opt back in.
+        if os.getenv("VLLM_ENABLE_THINKING", "false").lower() not in ("1", "true", "yes"):
+            kwargs.setdefault("extra_body", {})
+            kwargs["extra_body"].setdefault(
+                "chat_template_kwargs", {"enable_thinking": False}
+            )
     return kwargs
+
+
+def _resolve_max_tokens(model, messages):
+    """Dynamically clamp max_tokens so prompt + output fits the server's
+    max-model-len. Only applies to vllm/hosted_vllm. Returns dict that
+    callers merge into completion kwargs."""
+    if not model or not model.startswith(("vllm/", "hosted_vllm/")):
+        return {}
+    user_cap_v = get_llm_runtime_int("vllm_max_tokens", ("VLLM_MAX_TOKENS",), 2048)
+    if user_cap_v <= 0:
+        return {}  # opted out — leave server default
+    model_len = get_llm_runtime_int("vllm_max_model_len", ("VLLM_MAX_MODEL_LEN",), 16384)
+    margin = get_llm_runtime_int("vllm_ctx_margin", ("VLLM_CTX_MARGIN",), 256)
+    try:
+        prompt_text = "\n".join(m.get("content", "") for m in messages if isinstance(m.get("content"), str))
+        prompt_tokens = count_tokens(prompt_text, model=model) or 0
+    except Exception:
+        prompt_tokens = 0
+    headroom = model_len - prompt_tokens - margin
+    if headroom < 64:
+        # Prompt nearly fills (or overflows) the context. Server will
+        # likely reject; let it. Use a tiny output budget to surface the
+        # error fast rather than silently truncate.
+        headroom = 64
+    return {"max_tokens": min(user_cap_v, headroom)}
+
+
+def _extract_message_text(message):
+    """Return text content. Falls back to reasoning_content when the
+    server's reasoning-parser routed all tokens there (vLLM
+    --reasoning-parser, deepseek-r1, qwen3-thinking, etc.). Empty
+    `content` with non-empty `reasoning_content` would otherwise look
+    like an empty completion and trip JSON parsers."""
+    content = getattr(message, "content", None) or ""
+    if content.strip():
+        return content
+    reasoning = getattr(message, "reasoning_content", None) or ""
+    if reasoning.strip():
+        return reasoning
+    # LiteLLM also exposes reasoning under provider_specific_fields/_hidden_params
+    extras = getattr(message, "provider_specific_fields", None) or {}
+    if isinstance(extras, dict):
+        for key in ("reasoning_content", "reasoning"):
+            v = extras.get(key)
+            if isinstance(v, str) and v.strip():
+                return v
+    return content
 
 
 def llm_completion(model, prompt, chat_history=None, return_finish_reason=False):
@@ -89,6 +206,7 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
     extra = _provider_kwargs(model)
     max_retries = 10
     messages = list(chat_history) + [{"role": "user", "content": prompt}] if chat_history else [{"role": "user", "content": prompt}]
+    extra.update(_resolve_max_tokens(model, messages))
     for i in range(max_retries):
         try:
             response = litellm.completion(
@@ -97,7 +215,7 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                 temperature=0,
                 **extra,
             )
-            content = response.choices[0].message.content
+            content = _extract_message_text(response.choices[0].message)
             if return_finish_reason:
                 finish_reason = "max_output_reached" if response.choices[0].finish_reason == "length" else "finished"
                 return content, finish_reason
@@ -121,6 +239,7 @@ async def llm_acompletion(model, prompt):
     extra = _provider_kwargs(model)
     max_retries = 10
     messages = [{"role": "user", "content": prompt}]
+    extra.update(_resolve_max_tokens(model, messages))
     sem = _get_llm_sem()
     async with sem:
         for i in range(max_retries):
@@ -131,7 +250,7 @@ async def llm_acompletion(model, prompt):
                     temperature=0,
                     **extra,
                 )
-                return response.choices[0].message.content
+                return _extract_message_text(response.choices[0].message)
             except Exception as e:
                 print('************* Retrying *************')
                 logging.error(f"Error: {e}")
@@ -206,7 +325,18 @@ def extract_json(content):
             # Remove any trailing commas before closing brackets/braces
             json_content = json_content.replace(',]', ']').replace(',}', '}')
             return json.loads(json_content)
-        except:
+        except Exception:
+            # Last resort: json_repair handles common LLM mistakes —
+            # missing commas between objects, unescaped quotes, single
+            # quotes, unquoted keys, trailing commas. Catches Qwen3.5-9B
+            # outputs that emit `}{` or `} {` between array elements.
+            try:
+                from json_repair import repair_json
+                repaired = repair_json(json_content, return_objects=True)
+                if repaired not in ({}, [], "", None):
+                    return repaired
+            except Exception:
+                pass
             logging.error("Failed to parse JSON even after cleanup")
             return {}
     except Exception as e:
@@ -791,4 +921,3 @@ def print_tree(tree, indent=0):
 def print_wrapped(text, width=100):
     for line in text.splitlines():
         print(textwrap.fill(line, width=width))
-
