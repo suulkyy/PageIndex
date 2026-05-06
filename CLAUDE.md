@@ -9,13 +9,20 @@ PageIndex builds a hierarchical "table-of-contents" tree from long PDFs (or Mark
 ## Setup
 
 ```bash
-pip3 install --upgrade -r requirements.txt          # runtime
-pip3 install openai-agents                          # only for retrieval/agent demos
+# uv-managed (preferred — repo ships uv.lock + pyproject.toml)
+uv sync
+
+# pip-only fallback
+pip3 install --upgrade -r requirements.txt
+pip3 install openai-agents       # required for retrieve_pageindex.py + agent demos
+pip3 install json-repair          # required by extract_json fallback path
 ```
+
+`pyproject.toml` already pins `json-repair>=0.59.5` and `openai-agents[litellm]>=0.10.5`, so `uv sync` covers both. The `requirements.txt` path leaves them optional/commented — install manually if you don't use uv.
 
 `.env` must contain at least `OPENAI_API_KEY` (alias `CHATGPT_API_KEY` accepted). Multi-provider routing goes through LiteLLM, so any `provider/model` string LiteLLM supports works (e.g. `anthropic/claude-sonnet-4-6`).
 
-`pyproject.toml` declares `requires-python = ">=3.12"`. `uv.lock` is checked in — use `uv sync` if working with uv.
+`pyproject.toml` declares `requires-python = ">=3.12"`. `uv.lock` is checked in — use `uv sync` if working with uv. Run scripts via `uv run python <script.py>` (bare `python3` misses uv-managed deps like `python-dotenv`, `litellm`, `json-repair`).
 
 ## Commands
 
@@ -38,7 +45,20 @@ Flags specific to the verbose script:
 The verbose script delegates the actual pipeline to upstream `pageindex.page_index.page_index_main` (PDF) and `pageindex.page_index_md.md_to_tree` (MD) — same return shape, key ordering, and branching as `run_pageindex.py`. Verbose adds only: JsonLogger monkey-patch (live stderr previews), `_phase` timer around the whole PDF/MD pipeline + save, and the stdout/stderr tee.
 All other flags match `run_pageindex.py`.
 
-Common flags (all override `pageindex/config.yaml`): `--model`, `--toc-check-pages`, `--max-pages-per-node`, `--max-tokens-per-node`, `--if-add-node-id yes|no`, `--if-add-node-summary`, `--if-add-doc-description`, `--if-add-node-text`. Markdown-only: `--if-thinning`, `--thinning-threshold`, `--summary-token-threshold`.
+Common flags (all override `pageindex/config.yaml`): `--model`, `--toc-check-pages`, `--toc-verify-sample`, `--max-pages-per-node`, `--max-tokens-per-node`, `--if-add-node-id yes|no`, `--if-add-node-summary`, `--if-add-doc-description`, `--if-add-node-text`. Markdown-only: `--if-thinning`, `--thinning-threshold`, `--summary-token-threshold`.
+
+Runtime/provider flags (also in both scripts; preferred over env fallbacks — see `pageindex/utils.py:configure_llm_runtime`):
+- `--base-url` — OpenAI-compatible endpoint (vLLM/Ollama). Sets `vllm_base_url` / `ollama_base_url`.
+- `--vllm-timeout` — request timeout in seconds (default `1800`).
+- `--vllm-max-model-len` — server's `--max-model-len` value (default `16384`). Used by `_resolve_max_tokens` for headroom math.
+- `--vllm-max-tokens` — per-request output cap (default `2048`; `0` leaves server default). Dynamically clamped further by `_resolve_max_tokens`.
+- `--vllm-ctx-margin` — safety margin in tokens for chat-template overhead (default `256`).
+- `--llm-concurrency` — max in-flight async LLM calls (default `8`). Match this to vLLM `--max-num-seqs`.
+- `--group-max-tokens` — page grouping target for `process_no_toc` / chunked LLM calls. If unset, scales from `vllm_max_model_len − vllm_max_tokens − margin − group_prompt_overhead`, clamped to `[2000, min(model_len/2, 10000)]` for vLLM; defaults to `20000` for non-vLLM providers.
+- `--group-prompt-overhead` — token budget reserved for the prompt template wrapping each grouped page block (default `1600`).
+- `--toc-chunk-max-tokens` — max tokens per chunk when LLM-transforming a printed TOC into JSON (default `6000`). Used by `_toc_chunks` in the chunked LLM fallback.
+
+Old env vars still work as fallbacks: `VLLM_API_BASE`/`VLLM_BASE_URL`, `VLLM_TIMEOUT`, `VLLM_MAX_MODEL_LEN`, `VLLM_MAX_TOKENS`, `VLLM_CTX_MARGIN`, `PAGEINDEX_LLM_CONCURRENCY`, `PAGEINDEX_GROUP_MAX_TOKENS`, `PAGEINDEX_GROUP_PROMPT_OVERHEAD`, `PAGEINDEX_TOC_CHUNK_MAX_TOKENS`. CLI args win.
 
 #### Running with custom Ollama / vLLM models
 
@@ -72,6 +92,80 @@ python3 run_pageindex_verbose.py --pdf_path doc.pdf \
 - `pageindex/utils.py:_provider_kwargs` accepts both `vllm/` and `hosted_vllm/` for env-driven `api_base` injection.
 - `VLLM_TIMEOUT` — request timeout in seconds (default `1800`). LiteLLM's built-in default for `hosted_vllm` is 600s, which times out on slow remote hosts running big-context models (e.g. `litellm.Timeout: Hosted_vllmException - Connection timed out after 600.0 seconds`). Raise via `VLLM_TIMEOUT=3600` etc.
 - `PAGEINDEX_LLM_CONCURRENCY` — max in-flight async LLM calls (default `8`). Tree-build fans out via `asyncio.gather` at `verify_toc`, `check_title_appearance_in_start_concurrent`, `fix_incorrect_toc_with_retries`, `process_large_node_recursively`, and `generate_summaries_for_structure`. Without a cap, a long doc can fire 50+ concurrent requests at vLLM. On a single-GPU vLLM that overflows the GPU KV cache → vLLM preempts running sequences (KV usage observed dropping from ~99% to 0%, `Avg generation throughput` collapses to 0 t/s, requests cycle Running → Waiting). The cap lives in `pageindex/utils.py:_get_llm_sem` and wraps `llm_acompletion`. Raise on multi-GPU/big-VRAM hosts; lower if you still see preemption thrash.
+- vLLM `--reasoning-parser` (e.g. `qwen3`) splits model output: `<think>...</think>` goes to `message.reasoning_content`, the rest to `message.content`. If the visible content ends up empty, `extract_json` fails with `Expecting value: line 1 column 1 (char 0)` and `Failed to parse JSON even after cleanup`. Two safeguards: (1) `_extract_message_text` in `pageindex/utils.py` falls back to `reasoning_content` (and LiteLLM's `provider_specific_fields`) when `content` is empty; (2) `extract_json` strips `<think>...</think>` blocks before parsing. Best practice: don't enable `--reasoning-parser` for non-thinking instruct models (Qwen3.5-9B Instruct, etc.) — drop the flag to keep all tokens in `content`.
+- Qwen3 chat-template `enable_thinking` defaults to `True`. Even without `--reasoning-parser`, the model emits `<think>...</think>JSON` in raw `content`. If `max_tokens` truncates mid-think (no closing `</think>`), `extract_json`'s open-ended `<think>.*` fallback erases everything → empty string → the same `Expecting value: line 1 column 1` error. Mitigated by passing `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` per request — `pageindex/utils.py:_provider_kwargs` does this by default for `vllm/`/`hosted_vllm/` prefixes. Override:
+  - `VLLM_ENABLE_THINKING=true` — opt back into thinking (raises a hard requirement to also raise `VLLM_MAX_TOKENS` so the trace + JSON both fit). Note: `run_pageindex_verbose.py` hard-pins `VLLM_ENABLE_THINKING=false` (and `OLLAMA_THINK=false`) at module import. Tree-build issues hundreds of small JSON-only calls; thinking traces multiply wall-clock 2-4× and add no value. The pin overrides any externally-exported value, so you can keep `VLLM_ENABLE_THINKING=true` exported globally for `retrieve_pageindex.py` and tree-build still runs in instruct mode.
+  - `VLLM_MAX_TOKENS` — per-request `max_tokens` user cap (default `2048`, set `0` to leave server default). The actual `max_tokens` sent is the minimum of this cap and the dynamic headroom `max-model-len − prompt_tokens − margin` computed by `_resolve_max_tokens` per call (uses `litellm.token_counter`). PageIndex tree-build prompts can hit 14 k+ tokens (raw page text fed to TOC detectors); without dynamic clamping you get `litellm.ContextWindowExceededError: This model's maximum context length is 16384 tokens. However, you requested 2048 output tokens and your prompt contains at least 14337 input tokens, for a total of at least 16385 tokens.`
+  - `VLLM_MAX_MODEL_LEN` — server's `--max-model-len` value (default `16384`). Used by `_resolve_max_tokens` to size headroom. Bump to match if you raise server context (`--max-model-len 32768` → `VLLM_MAX_MODEL_LEN=32768`).
+  - `VLLM_CTX_MARGIN` — safety margin in tokens reserved beyond `prompt_tokens + max_tokens` (default `256`). Covers chat-template overhead, role tokens, end-of-turn markers, etc.
+
+##### Recommended vLLM serve script — Qwen3.5-9B multimodal on 2× RTX 5000 (Turing sm_75)
+
+Hardware: 2× Quadro RTX 5000, 16 GB each (32 GB total). No BF16, no Flash-Attention 2 (needs sm_80+), no Marlin INT4 kernel. Qwen3.5-9B is multimodal (text + image).
+
+```bash
+#!/usr/bin/env bash
+export VLLM_ATTENTION_BACKEND=XFORMERS     # FA2 needs sm_80+; Turing falls back to xformers
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export NCCL_P2P_DISABLE=1                  # RTX 5000 lacks NVLink; PCIe P2P often hangs at TP init
+export TOKENIZERS_PARALLELISM=false
+
+vllm serve Qwen/Qwen3.5-9B \
+  --served-model-name Qwen/Qwen3.5-9B \
+  --host 0.0.0.0 --port 8000 \
+  --dtype float16 \
+  --tensor-parallel-size 2 \
+  --max-model-len 16384 \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.88 \
+  --kv-cache-dtype auto \
+  --enable-prefix-caching \
+  --enable-auto-tool-choice \
+  --tool-call-parser hermes \
+  --limit-mm-per-prompt '{"image":2,"video":0}' \
+  --mm-processor-cache-type shm \
+  --mm-encoder-tp-mode data \
+  --disable-log-requests \
+  --trust-remote-code
+```
+
+Why each flag:
+- `--dtype float16` — Turing has no BF16. Qwen3.5 ships BF16; force FP16 downcast.
+- `--tensor-parallel-size 2` — split FP16 9B weights (~18 GB) across both GPUs.
+- `--max-model-len 16384` — multimodal context: each image consumes 1-4 k tokens (tile-dependent). 8 k too tight with 1-2 images.
+- `--max-num-seqs 4` — vision encoder activations + longer per-seq KV cap eat VRAM. Match this to client `PAGEINDEX_LLM_CONCURRENCY` so the queue lives client-side, not as server preemption.
+- `--max-num-batched-tokens 8192` — one full-context prefill at a time worst case.
+- `--gpu-memory-utilization 0.88` — 0.95 OOMs on 16 GB cards under TP=2; leave headroom for activation spikes.
+- `--enable-prefix-caching` — PageIndex reuses the same system prompt across many calls; big win.
+- `--enable-auto-tool-choice --tool-call-parser hermes` — needed by `retrieve_pageindex.py`; Qwen3.5 emits Hermes-style tool tags.
+- `--limit-mm-per-prompt '{"image":2,"video":0}'` — cap images per request (2). Block video — encoder-heavy, eats VRAM.
+- `--mm-processor-cache-type shm` — shared-memory cache for image preprocessing across TP workers; avoids duplicating processed tensors per worker.
+- `--mm-encoder-tp-mode data` — data-parallel vision encoder (each GPU encodes its own image batch) instead of TP-sharding the encoder. Lower comm overhead; vision encoder small enough to fit per-GPU.
+- `--trust-remote-code` — Qwen multimodal uses custom Python in the HF repo for the image preprocessor.
+
+Don't add `--reasoning-parser qwen3` — Qwen3.5-9B Instruct is non-thinking and the parser routes all output into `reasoning_content`, leaving `content` empty (see the `_extract_message_text` notes above). Don't add `--swap-space` — removed in vLLM 0.19.1; default preemption mode `recompute` handles spillover.
+
+Pair with these client-side envs (so client back-pressure absorbs concurrency limits instead of triggering server preemption):
+
+```bash
+export VLLM_API_BASE=http://<VLLM_HOST>:8000/v1
+export VLLM_TIMEOUT=3600
+export VLLM_MAX_TOKENS=2048          # default; leaves ~14 k for prompt within max-model-len 16384
+export VLLM_ENABLE_THINKING=false    # already default; explicit for clarity
+export PAGEINDEX_LLM_CONCURRENCY=4   # match --max-num-seqs
+```
+
+Quick verify after boot:
+```bash
+curl -sS http://<VLLM_HOST>:8000/v1/models | jq .
+# multimodal smoke (replace image URL):
+curl -sS -X POST http://<VLLM_HOST>:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen3.5-9B","messages":[{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"https://picsum.photos/256"}}]}],"max_tokens":128}'
+```
+
+If KV preempts still: drop `--max-num-seqs 2` or `--max-model-len 12288`. If OOM at model load: drop `--gpu-memory-utilization 0.85`. PageIndex tree-build is text-only; multimodal flags are no-ops on text requests.
 
 Outputs land in `./results/` regardless of provider. Scratch dirs `results_ollama/` and `results_vllm/` in repo root are user-managed copies — not auto-populated.
 
@@ -122,10 +216,12 @@ python3 retrieve_pageindex.py --folder ./results --question "..." \
 ```
 - Default `base_url` if unset: `http://localhost:8000/v1`. Override with `--base-url` or `VLLM_BASE_URL` to point at remote vLLM host.
 - vLLM server must be launched with `--enable-auto-tool-choice` and `--tool-call-parser <parser>` (e.g. `hermes`, `llama3_json`). Without these, the agent's tool calls return `400 - "auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set`.
-- Long-context KV pressure: agent message history grows every turn (tool outputs accumulate). Two env caps blunt this:
+- Long-context KV pressure: agent message history grows every turn (tool outputs accumulate). Env caps blunt this:
   - `PAGEINDEX_NODE_TEXT_MAX_CHARS` — truncate `get_node_content` text payload (default `16000`, set `0` to disable). Truncated payload includes `truncated: true`, `original_text_chars`, `truncated_to_chars`.
-  - `PAGEINDEX_AGENT_MAX_TOKENS` — `ModelSettings(max_tokens=…)` cap on per-turn output (default `2048`, set `0` to leave server default). Bounds vLLM's worst-case KV slot allocation.
+  - `PAGEINDEX_AGENT_MAX_TOKENS` — `ModelSettings(max_tokens=…)` cap on per-turn output (default `2048`, or `8192` when thinking retrieval is enabled and this env is unset; set `0` to leave server default). Bounds vLLM's worst-case KV slot allocation.
   - `PAGEINDEX_AGENT_MAX_TURNS` — `Runner.run_streamed(max_turns=…)` (default `30`, was upstream `100`). Cuts off runaway loops on weak models before history saturates KV.
+  - `PAGEINDEX_RETRIEVE_ENABLE_THINKING` — vLLM final-answer thinking switch (default `false`). Tool-loop turns always run with thinking disabled to keep tool-call format reliable; only the final answer-refinement pass uses thinking when this is enabled. For Qwen servers launched with `--reasoning-parser qwen3`, even this final pass stays disabled to avoid vLLM emitting tool-call intent in `reasoning` with `content: null`.
+  - `PAGEINDEX_RETRIEVE_THINKING_EVIDENCE_MAX_CHARS` — char budget for retrieved evidence fed into the final thinking pass (default `12000`).
 - API key fallback: `VLLM_API_KEY` → `"EMPTY"`.
 - Model name must match vLLM's `--served-model-name`.
 
@@ -149,7 +245,7 @@ None configured. No pytest, ruff, or CI test workflow. CI workflows under `.gith
 
 ## Architecture
 
-### Pipeline (`pageindex/page_index.py`, ~1150 lines, the core)
+### Pipeline (`pageindex/page_index.py`, ~1500 lines, the core)
 Entrypoint: `page_index_main(doc, opt) → page_index(...)` (sync wrappers around an async builder). Flow:
 
 1. `get_page_tokens` — parse PDF via PyPDF2 (default) or pymupdf, return `[(text, token_count), ...]`.
@@ -157,22 +253,30 @@ Entrypoint: `page_index_main(doc, opt) → page_index(...)` (sync wrappers aroun
    - `process_toc_with_page_numbers` (TOC found with page refs)
    - `process_toc_no_page_numbers` (TOC found, no refs)
    - `process_no_toc` (synthesize from content)
-3. `meta_processor` runs the chosen mode → produces a flat `toc_with_page_number` list of `{title, physical_index, list_index}`. Then `verify_toc` LLM-checks each title against its claimed page; if accuracy 0.6–1.0 it calls `fix_incorrect_toc_with_retries` (up to 3 attempts); below 0.6 it falls back to the next mode.
+3. `meta_processor` runs the chosen mode → produces a flat `toc_with_page_number` list of `{title, physical_index, list_index}`. Then `verify_toc` LLM-checks N entries (default `toc_verify_sample_num=40`; pass `0` to check all); if accuracy 0.6–1.0 it calls `fix_incorrect_toc_with_retries` (up to 3 attempts); below 0.6 it falls back to the next mode.
 4. `validate_and_truncate_physical_indices` nulls out indices past EOD.
-5. `add_preface_if_needed` + `check_title_appearance_in_start_concurrent` align titles to page boundaries.
+5. `add_preface_if_needed` + `check_title_appearance_in_start_concurrent` align titles to page boundaries. The concurrent checker first runs a local heuristic `check_title_appearance_in_start_heuristic` (normalized prefix match within first 1500 chars) — only items the heuristic can't classify fall through to an LLM call.
 6. `post_processing` (in `utils.py`) converts the flat list into a nested tree.
 7. `process_large_node_recursively` — for any node with span > `max_page_num_each_node` AND tokens ≥ `max_token_num_each_node`, recurse with `process_no_toc` to subdivide.
 8. Optional passes: `write_node_id` (zero-padded `0001`-style ids), `add_node_text` (slices page text into nodes), `generate_summaries_for_structure` (LLM, concurrent), `generate_doc_description` (top-level LLM summary).
+
+**TOC heuristics that pre-empt LLM calls** (added for textbook-scale inputs like `PRML.pdf`):
+- `parse_toc_content_heuristic` — deterministic line-by-line parser that emits `{structure, title, page}` items directly. `toc_transformer` uses it whenever it returns ≥8 items at confidence ≥0.65, skipping the LLM transform entirely.
+- `_toc_chunks` + `_transform_toc_chunk_with_llm` — when the heuristic isn't confident enough, the TOC text is split into ≤`toc_chunk_max_tokens` chunks (default 6000) and transformed chunk-by-chunk, then merged via `_merge_toc_items`. Avoids one giant JSON-generation call that would blow `max-model-len`.
+- `guess_page_offset_from_toc` — deterministic page-offset guess from the first content-page heuristic. Tried before falling back to `calculate_page_offset` over LLM-matched pairs.
+- `_finish_toc_json` — when an LLM TOC call returns `finish_reason=length`, salvages all complete JSON objects from the truncated buffer and re-prompts the model to "continue the structure" (up to 3 attempts) instead of raising.
 
 Markdown path (`pageindex/page_index_md.py`, `md_to_tree`) is a separate async pipeline keyed off `#`-heading levels — no PDF parsing, no TOC detection, optional thinning to merge sparse subsections.
 
 ### Config (`pageindex/utils.py:ConfigLoader`)
 Defaults live in `pageindex/config.yaml`; user dict is validated against that key set (unknown keys raise) then merged. Returns a `SimpleNamespace`. CLI scripts collect args, drop `None`, then call `ConfigLoader().load(user_opt)`.
 
-`config.yaml` keys: `model`, `retrieve_model` (falls back to `model`), `toc_check_page_num`, `max_page_num_each_node`, `max_token_num_each_node`, `if_add_node_id`, `if_add_node_summary`, `if_add_doc_description`, `if_add_node_text`. Yes/no flags are strings, not bools.
+`config.yaml` keys: `model`, `retrieve_model` (falls back to `model`), `toc_check_page_num`, `toc_verify_sample_num`, `max_page_num_each_node`, `max_token_num_each_node`, `if_add_node_id`, `if_add_node_summary`, `if_add_doc_description`, `if_add_node_text`. Yes/no flags are strings, not bools.
+
+Runtime knobs that change the LLM layer (concurrency, vLLM/Ollama URLs, max-tokens, group sizes) are NOT in `config.yaml` — they live in the per-process `_LLM_RUNTIME` dict managed by `pageindex/utils.py:configure_llm_runtime(**kwargs)`. CLI scripts call this once after `argparse.parse_args()` so subsequent `_provider_kwargs` / `_resolve_max_tokens` / `_get_llm_sem` reads pick up the values; absent CLI args, helpers fall back to the matching env vars (`get_llm_runtime_value(name, env_names, default)`).
 
 ### LLM layer (`pageindex/utils.py`)
-All LLM calls go through `llm_completion` / `llm_acompletion` — both wrap LiteLLM with `temperature=0`, retry up to 10× with 1s backoff, and strip a `litellm/` prefix before dispatch (LiteLLM picks provider from the rest of the string). `litellm.drop_params = True` — unsupported params silently dropped per provider. `extract_json` tolerates code fences and partial JSON when parsing model replies.
+All LLM calls go through `llm_completion` / `llm_acompletion` — both wrap LiteLLM with `temperature=0`, retry up to 10× with 1s backoff, and strip a `litellm/` prefix before dispatch (LiteLLM picks provider from the rest of the string). `litellm.drop_params = True` — unsupported params silently dropped per provider. `extract_json` tolerates code fences and partial JSON when parsing model replies. Cleanup chain: (1) raw_decode of first valid JSON, (2) `json.loads` after newline/whitespace normalize, (3) trailing-comma strip + `json.loads`, (4) `json_repair.repair_json` final fallback (handles missing commas between objects like `}{`, unescaped quotes inside strings, single-quoted keys, unquoted keys, trailing commas — common Qwen3.5-9B malformations seen as `Expecting ',' delimiter: line 1 column N`).
 
 ### Retrieval (`pageindex/retrieve.py`, `pageindex/client.py`)
 `retrieve.py` exposes 3 stateless tools over a `documents` dict: `get_document`, `get_document_structure` (text fields stripped), `get_page_content` (PDF: page nums; MD: line nums via `_get_md_page_content`). `client.py:PageIndexClient` is the user-facing wrapper — `index()` writes trees + cached page text into a workspace dir keyed by uuid; tools resolve through it. `_normalize_retrieve_model` keeps `litellm/` and `openai/` as passthrough but rewrites bare `provider/model` to `litellm/provider/model` so the OpenAI Agents SDK routes via LiteLLM.
@@ -189,4 +293,4 @@ Per-document JSON-line logger writing to `./logs/<sanitized_doc_name>.log`. `run
 - `physical_index` is internal during construction; the persisted output uses `start_index`/`end_index`.
 - `format_structure(..., order=[...])` enforces field ordering before serialization — keep new fields out of the order list if you don't want them surfaced.
 - `if_add_node_summary=yes` forces `add_node_text` even when `if_add_node_text=no`, then strips text after summarization (`remove_structure_text`).
-- The "results" directory committed in `examples/documents/` was deleted in the working tree (see `git status`); regenerate with `run_pageindex.py` if needed.
+- `examples/documents/` ships PDFs but the rendered `_structure.json` files under `examples/documents/results/` are git-ignored; regenerate with `run_pageindex.py` if you need them.
