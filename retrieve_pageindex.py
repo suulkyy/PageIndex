@@ -29,6 +29,11 @@ Env fallbacks:
     VLLM_BASE_URL, VLLM_API_KEY        vLLM
     OLLAMA_BASE_URL, OLLAMA_API_KEY    Ollama
     OPENAI_BASE_URL                    Override OpenAI base
+    PAGEINDEX_RETRIEVE_ENABLE_THINKING vLLM final-answer thinking, default false
+    PAGEINDEX_AGENT_MAX_TOKENS         Per-turn output cap. Default 2048, or
+                                       8192 when thinking retrieval is enabled.
+    PAGEINDEX_RETRIEVE_THINKING_EVIDENCE_MAX_CHARS
+                                       Evidence cap for final thinking pass.
 
 Each JSON in --folder must be a tree produced by run_pageindex.py / page_index_main,
 i.e. of shape {"doc_name": ..., "doc_description"?: ..., "structure": [...]}.
@@ -369,6 +374,13 @@ DEFAULT_BASE_URLS = {
 PROVIDER_PREFIXES = ("ollama/", "vllm/", "openai/", "litellm/")
 
 
+def _env_truthy(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
 def resolve_provider(model: str, provider: str) -> tuple[str, str]:
     """Return (provider, bare_model_name). Strip recognized provider prefixes from model."""
     if provider == "auto":
@@ -435,6 +447,84 @@ def _build_agent_model(provider: str, model: str, base_url: str | None, api_key:
     return OpenAIChatCompletionsModel(model=model, openai_client=client)
 
 
+async def _refine_vllm_answer_with_thinking(
+    model: str,
+    base_url: str,
+    api_key: str | None,
+    question: str,
+    draft: str,
+    tool_outputs: list[str],
+    max_tokens: int,
+) -> str:
+    """Run a final non-tool vLLM call with Qwen thinking enabled.
+
+    Tool turns stay non-thinking because qwen3 reasoning-parser can put tool
+    intent in `reasoning` without emitting valid OpenAI tool calls. This pass
+    gives users thinking during final answer synthesis without breaking tools.
+    """
+    try:
+        from openai import AsyncOpenAI
+    except ImportError:
+        logger.warning("openai package unavailable; skipping thinking refinement")
+        return draft
+
+    evidence_cap = int(os.getenv("PAGEINDEX_RETRIEVE_THINKING_EVIDENCE_MAX_CHARS", "12000"))
+    evidence = "\n\n".join(tool_outputs)
+    if evidence_cap > 0 and len(evidence) > evidence_cap:
+        evidence = evidence[:evidence_cap]
+
+    client = AsyncOpenAI(
+        base_url=base_url,
+        api_key=api_key or os.getenv("VLLM_API_KEY") or "EMPTY",
+    )
+    logger.info(
+        "running vLLM thinking refinement max_tokens=%s evidence_chars=%d",
+        max_tokens,
+        len(evidence),
+    )
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Answer the question using only the retrieval evidence and draft answer. "
+                        "Be concise. Preserve document/node citations if present."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question:\n{question}\n\n"
+                        f"Draft answer:\n{draft}\n\n"
+                        f"Retrieval evidence:\n{evidence}"
+                    ),
+                },
+            ],
+            temperature=0,
+            max_tokens=max_tokens,
+            extra_body={"chat_template_kwargs": {"enable_thinking": True}},
+        )
+    except Exception:
+        logger.exception("vLLM thinking refinement failed; returning draft answer")
+        return draft
+
+    choice = response.choices[0]
+    content = (choice.message.content or "").strip()
+    reasoning = getattr(choice.message, "reasoning", None) or getattr(choice.message, "reasoning_content", None) or ""
+    logger.info(
+        "vLLM thinking refinement finish_reason=%s content_chars=%d reasoning_chars=%d",
+        choice.finish_reason,
+        len(content),
+        len(reasoning),
+    )
+    if not content:
+        logger.warning("vLLM thinking refinement returned empty content; returning draft answer")
+        return draft
+    return content
+
+
 def query_agent(
     documents: dict,
     model: str,
@@ -484,22 +574,46 @@ def query_agent(
         """Get the full text of a specific node by its node_id."""
         return tool_get_node_content(documents, doc_id, node_id)
 
+    answer_thinking = _env_truthy("PAGEINDEX_RETRIEVE_ENABLE_THINKING", False)
+    if provider == "vllm" and answer_thinking and "PAGEINDEX_AGENT_MAX_TOKENS" not in os.environ:
+        default_max_tokens = 8192
+    else:
+        default_max_tokens = 2048
+
     # Bound output tokens per turn so vLLM/Ollama don't allocate worst-case
-    # KV slots for runaway generations. Overridable via env. 0 = unset
-    # (server default). Mainly relevant for local servers.
-    _max_out = int(os.getenv("PAGEINDEX_AGENT_MAX_TOKENS", "2048"))
+    # KV slots for runaway generations. Thinking retrieval needs more budget
+    # because qwen3 reasoning tokens precede final content.
+    _max_out = int(os.getenv("PAGEINDEX_AGENT_MAX_TOKENS", str(default_max_tokens)))
+    extra_body = None
+    if provider == "vllm":
+        # Keep the tool loop non-thinking. With vLLM --reasoning-parser qwen3,
+        # thinking tool turns can route tool intent into `reasoning` only and
+        # leave `content`/`tool_calls` empty. Optional thinking is applied later
+        # in a final answer refinement pass.
+        extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+        logger.info(
+            "vllm tool_loop_thinking=False answer_thinking=%s max_tokens=%s",
+            answer_thinking,
+            _max_out if _max_out > 0 else "server-default",
+        )
+
     agent_kwargs = dict(
         name="PageIndexLocal",
         instructions=AGENT_SYSTEM_PROMPT,
         tools=[list_documents, get_document, get_document_structure, get_node_content],
         model=agent_model,
     )
-    if _max_out > 0:
+    if _max_out > 0 or extra_body:
         try:
             from agents import ModelSettings
-            agent_kwargs["model_settings"] = ModelSettings(max_tokens=_max_out)
+            settings = {}
+            if _max_out > 0:
+                settings["max_tokens"] = _max_out
+            if extra_body:
+                settings["extra_body"] = extra_body
+            agent_kwargs["model_settings"] = ModelSettings(**settings)
         except ImportError:
-            logger.warning("agents.ModelSettings not available; max_tokens cap skipped")
+            logger.warning("agents.ModelSettings not available; model settings skipped")
     agent = Agent(**agent_kwargs)
 
     async def _run():
@@ -509,6 +623,7 @@ def query_agent(
         _max_turns = int(os.getenv("PAGEINDEX_AGENT_MAX_TURNS", "30"))
         streamed_run = Runner.run_streamed(agent, question, max_turns=_max_turns)
         current_kind = None
+        tool_outputs_for_refine = []
         async for event in streamed_run.stream_events():
             if isinstance(event, RawResponsesStreamEvent):
                 if isinstance(event.data, ResponseReasoningSummaryTextDeltaEvent):
@@ -538,6 +653,7 @@ def query_agent(
                     current_kind = None
                 elif item.type == "tool_call_output_item":
                     output = str(item.output)
+                    tool_outputs_for_refine.append(output)
                     preview = output[:200] + "..." if len(output) > 200 else output
                     # Log full output to file; keep stdout preview short.
                     logger.info("agent tool_output (%d chars): %s", len(output), output)
@@ -549,6 +665,22 @@ def query_agent(
         if current_kind is not None:
             print()
         final = "" if not streamed_run.final_output else str(streamed_run.final_output)
+        if final and provider == "vllm" and answer_thinking:
+            final = await _refine_vllm_answer_with_thinking(
+                model=bare_model,
+                base_url=resolved_base,
+                api_key=api_key,
+                question=question,
+                draft=final,
+                tool_outputs=tool_outputs_for_refine,
+                max_tokens=_max_out if _max_out > 0 else 8192,
+            )
+        if not final and provider == "vllm":
+            logger.warning(
+                "empty final answer from vLLM; if thinking is enabled, raise "
+                "PAGEINDEX_AGENT_MAX_TOKENS or disable thinking with "
+                "PAGEINDEX_RETRIEVE_ENABLE_THINKING=false"
+            )
         logger.info("agent final answer (%d chars): %s", len(final), final)
         return final
 
