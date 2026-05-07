@@ -32,6 +32,46 @@ pip3 install json-repair          # required by extract_json fallback path
 
 `.env` (gitignored via `.env*`) must contain at least `OPENAI_API_KEY` (alias `CHATGPT_API_KEY` accepted). Multi-provider routing goes through LiteLLM, so any `provider/model` string LiteLLM supports works (e.g. `anthropic/claude-sonnet-4-6`).
 
+### Sample `.env` for a remote vLLM (Qwen3.5-9B at `--max-model-len 65536`)
+
+Tuned for `vllm serve Qwen/Qwen3.5-9B --max-model-len 65536 --max-num-seqs 16 --enable-prefix-caching --enable-auto-tool-choice --reasoning-parser qwen3 --tool-call-parser qwen3_coder` (YARN factor 2.0). Tree-build half is sized to keep prompts under context; retrieval half is Pareto-tuned for quality + latency on single-question runs.
+
+```bash
+# ─── Tree-build (run_pageindex.py / run_pageindex_verbose.py) ──────────────
+VLLM_API_BASE=http://<VLLM_HOST>:8000/v1
+VLLM_TIMEOUT=3600
+PAGEINDEX_LLM_CONCURRENCY=16
+VLLM_MAX_TOKENS=1024
+VLLM_MAX_MODEL_LEN=65536
+VLLM_CTX_MARGIN=1024
+# VLLM_ENABLE_THINKING=true   # leave off — tree-build is JSON-only; thinking inflates wall-clock 2-4x with no quality gain
+
+# ─── Retrieval (retrieve_pageindex.py) — Pareto-tuned for quality + latency ─
+# Tool-loop turns are forced non-thinking (qwen3 reasoning-parser routes tool
+# intent into `reasoning`, breaking tool calls). Final-answer refinement runs
+# as a separate vLLM call with thinking enabled when
+# PAGEINDEX_RETRIEVE_ENABLE_THINKING=true. That single extra call buys
+# CoT-refined output for ~5-15s of latency — the biggest quality lever per Q.
+
+VLLM_BASE_URL=http://<VLLM_HOST>:8000/v1   # retrieval reads VLLM_BASE_URL (with /v1), not VLLM_API_BASE
+VLLM_API_KEY=EMPTY                         # AsyncOpenAI requires non-empty; vLLM ignores value
+
+PAGEINDEX_RETRIEVE_ENABLE_THINKING=true    # final answer goes through CoT refinement → biggest quality win
+PAGEINDEX_AGENT_MAX_TOKENS=8192            # needed so qwen3 thinking trace + final answer both fit per turn
+PAGEINDEX_AGENT_MAX_TURNS=30               # default — enough for textbook questions, caps runaway loops
+
+PAGEINDEX_NODE_TEXT_MAX_CHARS=16000        # 2× default; richer grounding for hard questions, fits in 65k window
+PAGEINDEX_STRUCTURE_SUMMARY_MAX_CHARS=300  # ~2× default; agent picks the right node sooner → fewer wasted turns (also throughput win)
+PAGEINDEX_RETRIEVE_THINKING_EVIDENCE_MAX_CHARS=20000  # more evidence into CoT pass → better refinement
+PAGEINDEX_TOOL_LOG_MAX_CHARS=4000          # log-file cap only; no quality/throughput effect
+
+# ─── Throughput-only profile (uncomment to disable thinking, ~5-15s faster per Q) ─
+# PAGEINDEX_RETRIEVE_ENABLE_THINKING=false
+# PAGEINDEX_AGENT_MAX_TOKENS=2048
+```
+
+Two-name gotcha: `VLLM_API_BASE` is read by the **tree-build** path (`pageindex/utils.py:_provider_kwargs`), `VLLM_BASE_URL` (with `/v1`) is read by the **retrieval** path (`retrieve_pageindex.py`). Set both to the same URL so either script works without `--base-url`.
+
 ## Commands
 
 ### Tree generation
