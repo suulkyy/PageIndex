@@ -170,11 +170,21 @@ def _resolve_max_tokens(model, messages):
     except Exception:
         prompt_tokens = 0
     headroom = model_len - prompt_tokens - margin
-    if headroom < 64:
-        # Prompt nearly fills (or overflows) the context. Server will
-        # likely reject; let it. Use a tiny output budget to surface the
-        # error fast rather than silently truncate.
-        headroom = 64
+    if headroom < 256:
+        # Prompt nearly fills (or overflows) the context. Old behavior was
+        # to clamp max_tokens to a 64-token floor and let vLLM raise
+        # `VLLMValidationError: prompt+output > max-model-len` (often by
+        # a single token, surfacing only as opaque server-side error
+        # after a real network round-trip). Raise client-side instead so
+        # the caller sees an actionable error before paying for the
+        # wasted call.
+        raise ValueError(
+            f"vLLM prompt budget exceeded: prompt={prompt_tokens} tok, "
+            f"margin={margin}, max_model_len={model_len}, "
+            f"headroom={headroom} (< 256). Reduce input via "
+            f"--toc-check-pages, --group-max-tokens, "
+            f"--toc-chunk-max-tokens, or raise --vllm-max-model-len."
+        )
     return {"max_tokens": min(user_cap_v, headroom)}
 
 
