@@ -987,15 +987,58 @@ def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_che
         toc_no_page_number = remove_page_number(copy.deepcopy(toc_with_page_number))
 
         start_page_index = toc_page_list[-1] + 1
-        main_content = ""
+        # Per-page snippets so we can pack into context-bounded chunks.
+        # Single-shot main_content of `toc_check_page_num` dense pages can
+        # exceed `max-model-len` on small-context vLLM servers (e.g. PRML
+        # at 65k context: 20 pages × ~3000 tok = 60k+, prompt overflows).
+        page_snippets = []
+        page_token_lens = []
         for page_index in range(start_page_index, min(start_page_index + toc_check_page_num, len(page_list))):
-            main_content += f"<physical_index_{page_index+1}>\n{page_list[page_index][0]}\n<physical_index_{page_index+1}>\n\n"
+            snippet = f"<physical_index_{page_index+1}>\n{page_list[page_index][0]}\n<physical_index_{page_index+1}>\n\n"
+            page_snippets.append(snippet)
+            page_token_lens.append(count_tokens(snippet, model=model) or 0)
 
-        toc_with_physical_index = toc_index_extractor(toc_no_page_number, main_content, model)
-        logger.info(f'toc_with_physical_index: {toc_with_physical_index}')
+        budget = _default_group_max_tokens(model)
+        toc_json_tokens = count_tokens(str(toc_no_page_number), model=model) or 0
+        # Reserve room for the toc JSON (replayed in every prompt) and a
+        # ~800-token prompt template overhead. Floor at 2000 so very long
+        # TOCs still split into one-page-at-a-time chunks instead of
+        # collapsing to zero.
+        content_budget = max(2000, budget - toc_json_tokens - 800)
+        logger.info(
+            f'toc_index chunking: budget={budget} toc_json_tokens={toc_json_tokens} '
+            f'content_budget={content_budget} pages={len(page_snippets)}'
+        )
 
-        toc_with_physical_index = convert_physical_index_to_int(toc_with_physical_index)
-        logger.info(f'toc_with_physical_index: {toc_with_physical_index}')
+        chunks = []
+        current = []
+        current_tokens = 0
+        for snippet, snippet_tokens in zip(page_snippets, page_token_lens):
+            if current and current_tokens + snippet_tokens > content_budget:
+                chunks.append(''.join(current))
+                current = [snippet]
+                current_tokens = snippet_tokens
+            else:
+                current.append(snippet)
+                current_tokens += snippet_tokens
+        if current:
+            chunks.append(''.join(current))
+        logger.info(f'toc_index_extractor running over {len(chunks)} chunk(s)')
+
+        toc_with_physical_index = []
+        for i, chunk in enumerate(chunks):
+            chunk_result = toc_index_extractor(toc_no_page_number, chunk, model)
+            if isinstance(chunk_result, dict):
+                # Defensive: extract_json may wrap list under a key
+                if isinstance(chunk_result.get('table_of_contents'), list):
+                    chunk_result = chunk_result['table_of_contents']
+                else:
+                    chunk_result = []
+            if not isinstance(chunk_result, list):
+                chunk_result = []
+            chunk_result = convert_physical_index_to_int(chunk_result)
+            toc_with_physical_index = _merge_toc_items(toc_with_physical_index, chunk_result)
+            logger.info(f'toc_index_extractor chunk {i+1}/{len(chunks)} added {len(chunk_result)} items; total={len(toc_with_physical_index)}')
 
         matching_pairs = extract_matching_page_pairs(toc_with_page_number, toc_with_physical_index, start_page_index)
         logger.info(f'matching_pairs: {matching_pairs}')
