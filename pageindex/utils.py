@@ -820,39 +820,88 @@ async def generate_summaries_for_structure(structure, model=None):
     return structure
 
 
-def create_clean_structure_for_description(structure):
+def create_clean_structure_for_description(structure, max_depth=None, summary_max_chars=None, _depth=0):
     """
     Create a clean structure for document description generation,
     excluding unnecessary fields like 'text'.
+
+    max_depth: drop child `nodes` past this depth (root is depth 0).
+    summary_max_chars: truncate `summary`/`prefix_summary` to this many chars.
     """
     if isinstance(structure, dict):
         clean_node = {}
-        # Only include essential fields for description
         for key in ['title', 'node_id', 'summary', 'prefix_summary']:
             if key in structure:
-                clean_node[key] = structure[key]
-        
-        # Recursively process child nodes
+                value = structure[key]
+                if (
+                    summary_max_chars
+                    and key in ('summary', 'prefix_summary')
+                    and isinstance(value, str)
+                    and len(value) > summary_max_chars
+                ):
+                    value = value[:summary_max_chars].rstrip() + '…'
+                clean_node[key] = value
+
         if 'nodes' in structure and structure['nodes']:
-            clean_node['nodes'] = create_clean_structure_for_description(structure['nodes'])
-        
+            if max_depth is None or _depth < max_depth:
+                clean_node['nodes'] = create_clean_structure_for_description(
+                    structure['nodes'], max_depth, summary_max_chars, _depth + 1
+                )
+
         return clean_node
     elif isinstance(structure, list):
-        return [create_clean_structure_for_description(item) for item in structure]
+        return [
+            create_clean_structure_for_description(item, max_depth, summary_max_chars, _depth)
+            for item in structure
+        ]
     else:
         return structure
 
 
 def generate_doc_description(structure, model=None):
-    prompt = f"""Your are an expert in generating descriptions for a document.
-    You are given a structure of a document. Your task is to generate a one-sentence description for the document, which makes it easy to distinguish the document from other documents.
-        
-    Document Structure: {structure}
-    
-    Directly return the description, do not include any other text.
+    """Build a doc description prompt that fits the server's context window.
+
+    For long books the full tree of summaries can exceed max-model-len. Try
+    progressively smaller representations until the prompt fits, falling
+    back to a titles-only outline as a last resort.
     """
-    response = llm_completion(model, prompt)
-    return response
+    def build_prompt(s):
+        return (
+            "Your are an expert in generating descriptions for a document.\n"
+            "You are given a structure of a document. Your task is to generate a one-sentence "
+            "description for the document, which makes it easy to distinguish the document from "
+            "other documents.\n\n"
+            f"Document Structure: {s}\n\n"
+            "Directly return the description, do not include any other text."
+        )
+
+    is_vllm = bool(model) and model.removeprefix("litellm/").startswith(("vllm/", "hosted_vllm/"))
+    if is_vllm:
+        model_len = get_llm_runtime_int("vllm_max_model_len", ("VLLM_MAX_MODEL_LEN",), 16384)
+        output_cap = get_llm_runtime_int("vllm_max_tokens", ("VLLM_MAX_TOKENS",), 2048) or 2048
+        margin = get_llm_runtime_int("vllm_ctx_margin", ("VLLM_CTX_MARGIN",), 256)
+        budget = model_len - output_cap - margin - 256  # 256 for chat-template framing
+    else:
+        budget = None  # OpenAI/Anthropic — context big enough, skip the dance
+
+    candidates = [
+        structure,
+        create_clean_structure_for_description(structure, summary_max_chars=400),
+        create_clean_structure_for_description(structure, max_depth=2, summary_max_chars=300),
+        create_clean_structure_for_description(structure, max_depth=1, summary_max_chars=200),
+        create_clean_structure_for_description(structure, max_depth=2, summary_max_chars=0),
+        create_clean_structure_for_description(structure, max_depth=1, summary_max_chars=0),
+    ]
+
+    chosen = candidates[-1]
+    if budget is not None:
+        for cand in candidates:
+            prompt = build_prompt(cand)
+            if (count_tokens(prompt, model=model) or 0) <= budget:
+                chosen = cand
+                break
+
+    return llm_completion(model, build_prompt(chosen))
 
 
 def reorder_dict(data, key_order):
