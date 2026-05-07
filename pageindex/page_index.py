@@ -866,7 +866,7 @@ def _finish_toc_json(prompt, response, finish_reason, model=None, logger=None, m
 
 
 ### add verify completeness
-def generate_toc_continue(toc_content, part, model=None, logger=None):
+def generate_toc_continue(toc_content, part, model=None, logger=None, tail_n=15):
     print('start generate_toc_continue')
     prompt = """
     You are an expert in extracting hierarchical tree structure.
@@ -878,10 +878,10 @@ def generate_toc_continue(toc_content, part, model=None, logger=None):
     For the title, you need to extract the original title from the text, only fix the space inconsistency.
 
     The provided text contains tags like <physical_index_X> and <physical_index_X> to indicate the start and end of page X. \
-    
+
     For the physical_index, you need to extract the physical index of the start of the section from the text. Keep the <physical_index_X> format.
 
-    The response should be in the following format. 
+    The response should be in the following format.
         [
             {
                 "structure": <structure index, "x.x.x"> (string),
@@ -889,11 +889,22 @@ def generate_toc_continue(toc_content, part, model=None, logger=None):
                 "physical_index": "<physical_index_X> (keep the format)"
             },
             ...
-        ]    
+        ]
 
     Directly return the additional part of the final JSON structure. Do not output anything else."""
 
-    prompt = prompt + '\nGiven text\n:' + part + '\nPrevious tree structure\n:' + json.dumps(toc_content, indent=2)
+    # Only ship the tail of the prior TOC. The model just needs the last few
+    # entries to know where to continue numbering. Shipping the entire
+    # accumulated tree grows the prompt linearly with iterations and overflows
+    # max-model-len on long books (an 800-page book can accumulate hundreds of
+    # entries → ~50k tokens of prior-TOC payload alone).
+    if isinstance(toc_content, list) and tail_n and len(toc_content) > tail_n:
+        prior = toc_content[-tail_n:]
+        prior_label = f'Previous tree structure (last {len(prior)} of {len(toc_content)} entries)'
+    else:
+        prior = toc_content
+        prior_label = 'Previous tree structure'
+    prompt = prompt + '\nGiven text\n:' + part + f'\n{prior_label}\n:' + json.dumps(prior, indent=2)
     response, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
     return _finish_toc_json(prompt, response, finish_reason, model=model, logger=logger)
     
@@ -941,8 +952,19 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None):
     toc_with_page_number = generate_toc_init(group_texts[0], model, logger=logger)
     if not isinstance(toc_with_page_number, list):
         toc_with_page_number = []
-    for group_text in group_texts[1:]:
-        toc_with_page_number_additional = generate_toc_continue(toc_with_page_number, group_text, model, logger=logger)
+    for chunk_idx, group_text in enumerate(group_texts[1:], start=1):
+        try:
+            toc_with_page_number_additional = generate_toc_continue(toc_with_page_number, group_text, model, logger=logger)
+        except Exception as e:
+            # One bad chunk shouldn't throw away tens of minutes of accumulated
+            # TOC work. Log and continue with what we have so far; downstream
+            # code can still build a partial tree.
+            if logger:
+                logger.info(
+                    f'generate_toc_continue failed on chunk {chunk_idx}/{len(group_texts) - 1}; '
+                    f'keeping {len(toc_with_page_number)} items so far. err={e}'
+                )
+            continue
         if isinstance(toc_with_page_number_additional, list):
             toc_with_page_number.extend(toc_with_page_number_additional)
     logger.info(f'generate_toc: {toc_with_page_number}')

@@ -246,6 +246,10 @@ Entrypoint: `page_index_main(doc, opt) → page_index(...)` (sync wrappers aroun
 - `guess_page_offset_from_toc` — deterministic page-offset guess from the first content-page heuristic. Tried before falling back to `calculate_page_offset` over LLM-matched pairs.
 - `_finish_toc_json` — when an LLM TOC call returns `finish_reason=length`, salvages all complete JSON objects from the truncated buffer and re-prompts the model to "continue the structure" (up to 3 attempts) instead of raising.
 
+**Synthesize-from-content (`process_no_toc`) prompt bounds** (added to keep the fallback mode usable on textbook-scale inputs):
+- `generate_toc_continue` ships only the *tail* of the accumulated TOC (default `tail_n=15`) instead of the entire tree. Previously it serialized every prior entry via `json.dumps(...indent=2)` on every iteration, so the prompt grew linearly with chunk count — an 800-page book accumulating hundreds of entries pushed prompts past 64 k tokens and tripped vLLM's `ContextWindowExceededError` on the final chunks. The tail gives the model enough context to continue numbering without ballooning the prompt.
+- `process_no_toc`'s per-chunk continuation loop wraps each `generate_toc_continue` call in `try/except` and logs `chunk N/M` on failure instead of unwinding the whole pipeline. One bad chunk deep in a 30-minute run no longer torches all prior accumulated TOC work — downstream code receives a partial tree and fills the gap.
+
 Markdown path (`pageindex/page_index_md.py`, `md_to_tree`) is a separate async pipeline keyed off `#`-heading levels — no PDF parsing, no TOC detection, optional thinning to merge sparse subsections.
 
 ### Config (`pageindex/utils.py:ConfigLoader`)
