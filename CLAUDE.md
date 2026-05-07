@@ -6,10 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 PageIndex builds a hierarchical "table-of-contents" tree from long PDFs (or Markdown) and uses LLM tree search for vectorless, reasoning-based RAG. No vector DB, no chunking. Output is a JSON tree of nodes with `title`, `node_id`, `start_index`/`end_index` (PDF) or `line_num` (MD), optional `summary`/`text`, and nested `nodes`.
 
+## Repo layout (tracked files only)
+
+- Top level: `run_pageindex.py`, `run_pageindex_verbose.py`, `retrieve_pageindex.py`, `pyproject.toml`, `requirements.txt`, `LICENSE`, `README.md`, `AGENTS.md`, `CLAUDE.md`.
+- `pageindex/` package: `page_index.py` (PDF pipeline), `page_index_md.py` (Markdown pipeline), `utils.py` (LLM layer, config loader, helpers), `retrieve.py` + `client.py` (programmatic retrieval), `config.yaml` (defaults), `__init__.py`.
+- `cookbook/` notebooks: `pageindex_RAG_simple.ipynb`, `vision_RAG_pageindex.ipynb`, `agentic_retrieval.ipynb`, `pageIndex_chat_quickstart.ipynb`, `README.md`.
+- `examples/` — `agentic_vectorless_rag_demo.py`, `documents/` (sample PDFs + pre-built `_structure.json` outputs under `documents/results/`), `tutorials/doc-search/`, `tutorials/tree-search/`, `workspace/` (sample workspace dump used by `PageIndexClient`).
+- `.github/` — workflows for CodeQL, dependency review, and issue dedupe (`autoclose-labeled-issues`, `backfill-dedupe`, `issue-dedupe`, `remove-autoclose-label`); `.claude/commands/dedupe.md` is the dedupe agent prompt.
+
 ## Setup
 
 ```bash
-# uv-managed (preferred — repo ships uv.lock + pyproject.toml)
+# uv-managed (preferred — pyproject.toml pins everything)
 uv sync
 
 # pip-only fallback
@@ -20,9 +28,9 @@ pip3 install json-repair          # required by extract_json fallback path
 
 `pyproject.toml` already pins `json-repair>=0.59.5` and `openai-agents[litellm]>=0.10.5`, so `uv sync` covers both. The `requirements.txt` path leaves them optional/commented — install manually if you don't use uv.
 
-`.env` must contain at least `OPENAI_API_KEY` (alias `CHATGPT_API_KEY` accepted). Multi-provider routing goes through LiteLLM, so any `provider/model` string LiteLLM supports works (e.g. `anthropic/claude-sonnet-4-6`).
+`pyproject.toml` declares `requires-python = ">=3.12"`. Run scripts via `uv run python <script.py>` (bare `python3` misses uv-managed deps like `python-dotenv`, `litellm`, `json-repair`).
 
-`pyproject.toml` declares `requires-python = ">=3.12"`. `uv.lock` is checked in — use `uv sync` if working with uv. Run scripts via `uv run python <script.py>` (bare `python3` misses uv-managed deps like `python-dotenv`, `litellm`, `json-repair`).
+`.env` (gitignored via `.env*`) must contain at least `OPENAI_API_KEY` (alias `CHATGPT_API_KEY` accepted). Multi-provider routing goes through LiteLLM, so any `provider/model` string LiteLLM supports works (e.g. `anthropic/claude-sonnet-4-6`).
 
 ## Commands
 
@@ -31,7 +39,7 @@ pip3 install json-repair          # required by extract_json fallback path
 python3 run_pageindex.py --pdf_path path/to/doc.pdf
 python3 run_pageindex.py --md_path  path/to/doc.md
 ```
-Output: `./results/<basename>_structure.json`. JSON logger writes per-doc trace to `./logs/`.
+Output: `./results/<basename>_structure.json` (`results/` is created on first run; gitignored output dir). JSON logger writes per-doc trace to `./logs/` (also gitignored).
 
 Verbose variant streams phase timings + log previews to stderr (final save still on stdout):
 ```bash
@@ -99,77 +107,7 @@ python3 run_pageindex_verbose.py --pdf_path doc.pdf \
   - `VLLM_MAX_MODEL_LEN` — server's `--max-model-len` value (default `16384`). Used by `_resolve_max_tokens` to size headroom. Bump to match if you raise server context (`--max-model-len 32768` → `VLLM_MAX_MODEL_LEN=32768`).
   - `VLLM_CTX_MARGIN` — safety margin in tokens reserved beyond `prompt_tokens + max_tokens` (default `256`). Covers chat-template overhead, role tokens, end-of-turn markers, etc.
 
-##### Recommended vLLM serve script — Qwen3.5-9B multimodal on 2× RTX 5000 (Turing sm_75)
-
-Hardware: 2× Quadro RTX 5000, 16 GB each (32 GB total). No BF16, no Flash-Attention 2 (needs sm_80+), no Marlin INT4 kernel. Qwen3.5-9B is multimodal (text + image).
-
-```bash
-#!/usr/bin/env bash
-export VLLM_ATTENTION_BACKEND=XFORMERS     # FA2 needs sm_80+; Turing falls back to xformers
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export NCCL_P2P_DISABLE=1                  # RTX 5000 lacks NVLink; PCIe P2P often hangs at TP init
-export TOKENIZERS_PARALLELISM=false
-
-vllm serve Qwen/Qwen3.5-9B \
-  --served-model-name Qwen/Qwen3.5-9B \
-  --host 0.0.0.0 --port 8000 \
-  --dtype float16 \
-  --tensor-parallel-size 2 \
-  --max-model-len 16384 \
-  --max-num-seqs 4 \
-  --max-num-batched-tokens 8192 \
-  --gpu-memory-utilization 0.88 \
-  --kv-cache-dtype auto \
-  --enable-prefix-caching \
-  --enable-auto-tool-choice \
-  --tool-call-parser hermes \
-  --limit-mm-per-prompt '{"image":2,"video":0}' \
-  --mm-processor-cache-type shm \
-  --mm-encoder-tp-mode data \
-  --disable-log-requests \
-  --trust-remote-code
-```
-
-Why each flag:
-- `--dtype float16` — Turing has no BF16. Qwen3.5 ships BF16; force FP16 downcast.
-- `--tensor-parallel-size 2` — split FP16 9B weights (~18 GB) across both GPUs.
-- `--max-model-len 16384` — multimodal context: each image consumes 1-4 k tokens (tile-dependent). 8 k too tight with 1-2 images.
-- `--max-num-seqs 4` — vision encoder activations + longer per-seq KV cap eat VRAM. Match this to client `PAGEINDEX_LLM_CONCURRENCY` so the queue lives client-side, not as server preemption.
-- `--max-num-batched-tokens 8192` — one full-context prefill at a time worst case.
-- `--gpu-memory-utilization 0.88` — 0.95 OOMs on 16 GB cards under TP=2; leave headroom for activation spikes.
-- `--enable-prefix-caching` — PageIndex reuses the same system prompt across many calls; big win.
-- `--enable-auto-tool-choice --tool-call-parser hermes` — needed by `retrieve_pageindex.py`; Qwen3.5 emits Hermes-style tool tags.
-- `--limit-mm-per-prompt '{"image":2,"video":0}'` — cap images per request (2). Block video — encoder-heavy, eats VRAM.
-- `--mm-processor-cache-type shm` — shared-memory cache for image preprocessing across TP workers; avoids duplicating processed tensors per worker.
-- `--mm-encoder-tp-mode data` — data-parallel vision encoder (each GPU encodes its own image batch) instead of TP-sharding the encoder. Lower comm overhead; vision encoder small enough to fit per-GPU.
-- `--trust-remote-code` — Qwen multimodal uses custom Python in the HF repo for the image preprocessor.
-
-Don't add `--reasoning-parser qwen3` — Qwen3.5-9B Instruct is non-thinking and the parser routes all output into `reasoning_content`, leaving `content` empty (see the `_extract_message_text` notes above). Don't add `--swap-space` — removed in vLLM 0.19.1; default preemption mode `recompute` handles spillover.
-
-Pair with these client-side envs (so client back-pressure absorbs concurrency limits instead of triggering server preemption):
-
-```bash
-export VLLM_API_BASE=http://<VLLM_HOST>:8000/v1
-export VLLM_TIMEOUT=3600
-export VLLM_MAX_TOKENS=2048          # default; leaves ~14 k for prompt within max-model-len 16384
-export VLLM_ENABLE_THINKING=false    # already default; explicit for clarity
-export PAGEINDEX_LLM_CONCURRENCY=4   # match --max-num-seqs
-```
-
-Quick verify after boot:
-```bash
-curl -sS http://<VLLM_HOST>:8000/v1/models | jq .
-# multimodal smoke (replace image URL):
-curl -sS -X POST http://<VLLM_HOST>:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"Qwen/Qwen3.5-9B","messages":[{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"https://picsum.photos/256"}}]}],"max_tokens":128}'
-```
-
-If KV preempts still: drop `--max-num-seqs 2` or `--max-model-len 12288`. If OOM at model load: drop `--gpu-memory-utilization 0.85`. PageIndex tree-build is text-only; multimodal flags are no-ops on text requests.
-
-Outputs land in `./results/` regardless of provider. Scratch dirs `results_ollama/` and `results_vllm/` in repo root are user-managed copies — not auto-populated.
-
-For best retrieval, pass `--if-add-node-text yes --if-add-node-id yes` (else agent must answer from summaries alone).
+Outputs land in `./results/` regardless of provider. For best retrieval, pass `--if-add-node-text yes --if-add-node-id yes` (else agent must answer from summaries alone).
 
 ### Local retrieval over a folder of trees
 ```bash
@@ -260,9 +198,9 @@ Entrypoint: `page_index_main(doc, opt) → page_index(...)` (sync wrappers aroun
 5. `add_preface_if_needed` + `check_title_appearance_in_start_concurrent` align titles to page boundaries. The concurrent checker first runs a local heuristic `check_title_appearance_in_start_heuristic` (normalized prefix match within first 1500 chars) — only items the heuristic can't classify fall through to an LLM call.
 6. `post_processing` (in `utils.py`) converts the flat list into a nested tree.
 7. `process_large_node_recursively` — for any node with span > `max_page_num_each_node` AND tokens ≥ `max_token_num_each_node`, recurse with `process_no_toc` to subdivide.
-8. Optional passes: `write_node_id` (zero-padded `0001`-style ids), `add_node_text` (slices page text into nodes), `generate_summaries_for_structure` (LLM, concurrent), `generate_doc_description` (top-level LLM summary).
+8. Optional passes: `write_node_id` (zero-padded `0001`-style ids), `add_node_text` (slices page text into nodes), `generate_summaries_for_structure` (LLM, concurrent), `generate_doc_description` (top-level LLM summary). For vLLM models, `generate_doc_description` token-budgets its prompt against `vllm_max_model_len − vllm_max_tokens − vllm_ctx_margin − 256` and progressively shrinks the structure (full → summaries truncated to 400 chars → depth ≤2 + 300 chars → depth ≤1 + 200 chars → depth ≤2 titles-only → depth ≤1 titles-only) until it fits. Without this, a 700+-page book like `examples/documents/PRML.pdf` produces an 85k-token clean structure that overflows even a 65k context. `create_clean_structure_for_description` accepts `max_depth` and `summary_max_chars` to drive the trim ladder.
 
-**TOC heuristics that pre-empt LLM calls** (added for textbook-scale inputs like `PRML.pdf`):
+**TOC heuristics that pre-empt LLM calls** (added for textbook-scale inputs like `examples/documents/PRML.pdf`):
 - `parse_toc_content_heuristic` — deterministic line-by-line parser that emits `{structure, title, page}` items directly. `toc_transformer` uses it whenever it returns ≥8 items at confidence ≥0.65, skipping the LLM transform entirely.
 - `_toc_chunks` + `_transform_toc_chunk_with_llm` — when the heuristic isn't confident enough, the TOC text is split into ≤`toc_chunk_max_tokens` chunks (default 6000) and transformed chunk-by-chunk, then merged via `_merge_toc_items`. Avoids one giant JSON-generation call that would blow `max-model-len`.
 - `guess_page_offset_from_toc` — deterministic page-offset guess from the first content-page heuristic. Tried before falling back to `calculate_page_offset` over LLM-matched pairs.
@@ -281,7 +219,7 @@ Runtime knobs that change the LLM layer (concurrency, vLLM/Ollama URLs, max-toke
 All LLM calls go through `llm_completion` / `llm_acompletion` — both wrap LiteLLM with `temperature=0`, retry up to 10× with 1s backoff, and strip a `litellm/` prefix before dispatch (LiteLLM picks provider from the rest of the string). `litellm.drop_params = True` — unsupported params silently dropped per provider. `extract_json` tolerates code fences and partial JSON when parsing model replies. Cleanup chain: (1) raw_decode of first valid JSON, (2) `json.loads` after newline/whitespace normalize, (3) trailing-comma strip + `json.loads`, (4) `json_repair.repair_json` final fallback (handles missing commas between objects like `}{`, unescaped quotes inside strings, single-quoted keys, unquoted keys, trailing commas — common Qwen3.5-9B malformations seen as `Expecting ',' delimiter: line 1 column N`).
 
 ### Retrieval (`pageindex/retrieve.py`, `pageindex/client.py`)
-`retrieve.py` exposes 3 stateless tools over a `documents` dict: `get_document`, `get_document_structure` (text fields stripped), `get_page_content` (PDF: page nums; MD: line nums via `_get_md_page_content`). `client.py:PageIndexClient` is the user-facing wrapper — `index()` writes trees + cached page text into a workspace dir keyed by uuid; tools resolve through it. `_normalize_retrieve_model` keeps `litellm/` and `openai/` as passthrough but rewrites bare `provider/model` to `litellm/provider/model` so the OpenAI Agents SDK routes via LiteLLM.
+`retrieve.py` exposes 3 stateless tools over a `documents` dict: `get_document`, `get_document_structure` (text fields stripped), `get_page_content` (PDF: page nums; MD: line nums via `_get_md_page_content`). `client.py:PageIndexClient` is the user-facing wrapper — `index()` writes trees + cached page text into a workspace dir keyed by uuid; tools resolve through it. A sample workspace lives at `examples/workspace/` (`_meta.json` + uuid-keyed JSON) for hands-on exploration. `_normalize_retrieve_model` keeps `litellm/` and `openai/` as passthrough but rewrites bare `provider/model` to `litellm/provider/model` so the OpenAI Agents SDK routes via LiteLLM.
 
 ### Standalone retriever (`retrieve_pageindex.py`)
 Loads `*.json` from a folder, infers PDF vs MD per-file by node fields (`start_index` → pdf, `line_num` → md). The agent gets **5 tools**:
@@ -294,7 +232,7 @@ Loads `*.json` from a folder, infers PDF vs MD per-file by node fields (`start_i
 The agent is constructed with `parallel_tool_calls=False` (serial tool calling) — keeps tool order deterministic and avoids weak models interleaving partial calls. `resolve_provider` strips known prefixes; `_build_agent_model` constructs an `AsyncOpenAI` client + `OpenAIChatCompletionsModel` for vllm/ollama (Chat Completions, not Responses API). Streams reasoning + tool calls live; falls back to `asyncio.run` in a worker thread when called from inside an existing loop.
 
 ### Logging (`pageindex/utils.py:JsonLogger`)
-Per-document JSON-line logger writing to `./logs/<sanitized_doc_name>.log`. `run_pageindex_verbose.py` monkey-patches it to also emit single-line stderr previews, then tees both `sys.stdout` and `sys.stderr` into a separate timestamped tee log (`./logs/run_<YYYYMMDD_HHMMSS>.log`) so all upstream prints + tracebacks are captured. The tee adds `[YYYY-MM-DD HH:MM:SS.mmm]` per bare line in the file copy; lines that already begin with a timestamp pattern pass through unchanged. `retrieve_pageindex.py` does the same stdout+stderr tee into `./logs/retrieve_<YYYYMMDD_HHMMSS>.log`, with a single `StreamHandler` pointed at the (already-tee'd) `sys.stderr` — there's no separate `FileHandler`, so logger lines reach the file via the tee and never double-write.
+Per-document JSON-line logger writing to `./logs/<sanitized_doc_name>.log` (`logs/` is gitignored). `run_pageindex_verbose.py` monkey-patches it to also emit single-line stderr previews, then tees both `sys.stdout` and `sys.stderr` into a separate timestamped tee log (`./logs/run_<YYYYMMDD_HHMMSS>.log`) so all upstream prints + tracebacks are captured. The tee adds `[YYYY-MM-DD HH:MM:SS.mmm]` per bare line in the file copy; lines that already begin with a timestamp pattern pass through unchanged. `retrieve_pageindex.py` does the same stdout+stderr tee into `./logs/retrieve_<YYYYMMDD_HHMMSS>.log`, with a single `StreamHandler` pointed at the (already-tee'd) `sys.stderr` — there's no separate `FileHandler`, so logger lines reach the file via the tee and never double-write.
 
 ## Conventions worth knowing
 
@@ -302,5 +240,7 @@ Per-document JSON-line logger writing to `./logs/<sanitized_doc_name>.log`. `run
 - `physical_index` is internal during construction; the persisted output uses `start_index`/`end_index`.
 - `format_structure(..., order=[...])` enforces field ordering before serialization — keep new fields out of the order list if you don't want them surfaced.
 - `if_add_node_summary=yes` forces `add_node_text` even when `if_add_node_text=no`, then strips text after summarization (`remove_structure_text`).
-- `examples/documents/` ships PDFs but the rendered `_structure.json` files under `examples/documents/results/` are git-ignored; regenerate with `run_pageindex.py` if you need them.
+- `examples/documents/` ships sample PDFs and the corresponding pre-built trees under `examples/documents/results/*_structure.json` are checked in — handy fixtures for retrieval demos without re-running the pipeline.
+- `examples/tutorials/doc-search/` and `examples/tutorials/tree-search/` hold walkthrough notes (Markdown only) for the two retrieval styles.
+- `.gitignore` excludes `.env*`, `.venv/`, `logs/`, `__pycache__`, `.ipynb_checkpoints`, `.DS_Store`. Anything you generate under `./results/` or `./logs/` stays local.
 - See `AGENTS.md` for repo-wide contributor guidelines (style, commit format, security tips). It's the human-facing companion to this file; keep the two consistent.
