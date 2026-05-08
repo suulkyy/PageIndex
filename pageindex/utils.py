@@ -665,6 +665,17 @@ def post_processing(structure, end_physical_index):
                 item['end_index'] = structure[i + 1]['physical_index']
         else:
             item['end_index'] = end_physical_index
+        # Clamp inverted spans (end < start). Happens when two consecutive
+        # items share the same physical_index and the next has
+        # appear_start='yes' — the `next.physical_index - 1` rule would put
+        # end one page before start. Treat as a single-page node instead of
+        # surfacing pp15-14 / pp20-19 / pp31-30 in the final tree.
+        if (
+            isinstance(item.get('start_index'), int)
+            and isinstance(item.get('end_index'), int)
+            and item['end_index'] < item['start_index']
+        ):
+            item['end_index'] = item['start_index']
     tree = list_to_tree(structure)
     if len(tree)!=0:
         return tree

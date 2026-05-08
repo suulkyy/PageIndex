@@ -782,6 +782,89 @@ def _extract_complete_toc_items(content):
     return items
 
 
+_CONTINUATION_SUFFIX_RE = re.compile(
+    r'\s*[\(\[\-–—]+\s*(?:continued|cont\.?|cont\'d|part\s*\d+)\s*[\)\]]?\s*$',
+    re.I,
+)
+
+
+def _strip_continuation_suffix(title):
+    """Remove trailing '(Continued)', 'cont.', '- Part 2' etc. so that the
+    same logical section emitted across multiple chunks collapses to one
+    title."""
+    if not isinstance(title, str):
+        return title
+    cleaned = title
+    # Strip repeatedly in case the model stacked suffixes ("X (cont) (cont)").
+    for _ in range(3):
+        new = _CONTINUATION_SUFFIX_RE.sub('', cleaned).rstrip()
+        if new == cleaned:
+            break
+        cleaned = new
+    return cleaned
+
+
+def _normalize_title_for_match(title):
+    if not isinstance(title, str):
+        return ''
+    return re.sub(r'\s+', ' ', _strip_continuation_suffix(title)).strip().lower()
+
+
+def _collapse_continuation_items(items, logger=None):
+    """Drop continuation echoes the model emits when a section spans several
+    chunks. Two adjacent items collapse when they share the same `structure`
+    key OR the same normalized title (after stripping (Continued)/Part N
+    suffixes). The first occurrence wins; later echoes are folded away.
+    Single-page span repeats at the same physical_index are also collapsed
+    even when not adjacent — keeps process_large_node_recursively from
+    fanning a one-page node into N siblings."""
+    if not isinstance(items, list):
+        return items
+    cleaned = []
+    seen_struct_phys = set()
+    seen_title_phys = set()
+    dropped = 0
+    for it in items:
+        if not isinstance(it, dict):
+            cleaned.append(it)
+            continue
+        title = _strip_continuation_suffix(str(it.get('title', '')))
+        it['title'] = title
+        struct = str(it.get('structure', '') or '')
+        phys = str(it.get('physical_index', '') or '')
+        norm_title = _normalize_title_for_match(title)
+
+        # Adjacent collapse against last kept item.
+        if cleaned:
+            prev = cleaned[-1]
+            prev_struct = str(prev.get('structure', '') or '')
+            prev_title = _normalize_title_for_match(prev.get('title', ''))
+            same_struct = bool(struct) and struct == prev_struct
+            same_title = bool(norm_title) and norm_title == prev_title
+            if same_struct or same_title:
+                dropped += 1
+                continue
+
+        # Non-adjacent collapse: same (structure, physical_index) or
+        # (title, physical_index) seen earlier in the list.
+        if struct and phys and (struct, phys) in seen_struct_phys:
+            dropped += 1
+            continue
+        if norm_title and phys and (norm_title, phys) in seen_title_phys:
+            dropped += 1
+            continue
+
+        cleaned.append(it)
+        if struct and phys:
+            seen_struct_phys.add((struct, phys))
+        if norm_title and phys:
+            seen_title_phys.add((norm_title, phys))
+
+    if dropped and logger:
+        logger.info(f'_collapse_continuation_items dropped {dropped} continuation echoes')
+    return cleaned
+
+
 def _merge_toc_items(existing, new_items):
     """Append new TOC entries while deduplicating by
     (structure, title, physical_index, page) — guards against the model
@@ -881,6 +964,13 @@ def generate_toc_continue(toc_content, part, model=None, logger=None, tail_n=15)
 
     For the physical_index, you need to extract the physical index of the start of the section from the text. Keep the <physical_index_X> format.
 
+    Strict continuation rules (follow exactly):
+    - Only emit a section when its heading actually begins inside the given text.
+    - Do NOT repeat any section already present in "Previous tree structure".
+    - Do NOT add suffixes like "(Continued)", "(cont.)", "Part 2", or fabricate a new structure index ("F.1", "F.2") for a section that has already been emitted. A section that physically continues from an earlier chunk must be skipped entirely.
+    - If the current text contains no new section starts, return [] and nothing else.
+    - Never invent headings that are not visibly printed in the text.
+
     The response should be in the following format.
         [
             {
@@ -966,8 +1056,19 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None):
                 )
             continue
         if isinstance(toc_with_page_number_additional, list):
-            toc_with_page_number.extend(toc_with_page_number_additional)
+            # Dedup-on-extend: prevents the LLM repeating prior entries
+            # (structure, title, physical_index, page key match) across
+            # continuation chunks.
+            toc_with_page_number = _merge_toc_items(
+                toc_with_page_number, toc_with_page_number_additional
+            )
     logger.info(f'generate_toc: {toc_with_page_number}')
+
+    # Collapse '(Continued)' echoes the model invents to dodge the dedup key —
+    # different `structure` keys ("F.1", "F.2") on identical physical_index get
+    # folded back into one section here.
+    toc_with_page_number = _collapse_continuation_items(toc_with_page_number, logger=logger)
+    logger.info(f'after _collapse_continuation_items: {toc_with_page_number}')
 
     toc_with_page_number = convert_physical_index_to_int(toc_with_page_number)
     logger.info(f'convert_physical_index_to_int: {toc_with_page_number}')
@@ -1437,15 +1538,27 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
         
  
 async def process_large_node_recursively(node, page_list, opt=None, logger=None):
+    # Single-page (or zero-span) nodes can never be subdivided meaningfully —
+    # children would all carry the parent's physical_index and collapse to
+    # duplicate siblings. Skip outright; also short-circuit obviously
+    # inverted spans that may have leaked through.
+    span_pages = (node.get('end_index') or 0) - (node.get('start_index') or 0) + 1
+    if span_pages <= 1:
+        return node
+
     node_page_list = page_list[node['start_index']-1:node['end_index']]
     token_num = sum([page[1] for page in node_page_list])
-    
+
     if node['end_index'] - node['start_index'] > opt.max_page_num_each_node and token_num >= opt.max_token_num_each_node:
         print('large node:', node['title'], 'start_index:', node['start_index'], 'end_index:', node['end_index'], 'token_num:', token_num)
 
         node_toc_tree = await meta_processor(node_page_list, mode='process_no_toc', start_index=node['start_index'], opt=opt, logger=logger)
+        # Belt-and-braces: collapse any '(Continued)'/duplicate-structure
+        # echoes the model produced inside this recursion before they become
+        # tree siblings.
+        node_toc_tree = _collapse_continuation_items(node_toc_tree, logger=logger)
         node_toc_tree = await check_title_appearance_in_start_concurrent(node_toc_tree, page_list, model=opt.model, logger=logger)
-        
+
         # Filter out items with None physical_index before post_processing
         valid_node_toc_items = [item for item in node_toc_tree if item.get('physical_index') is not None]
         
