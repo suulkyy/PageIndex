@@ -545,7 +545,13 @@ async def _refine_vllm_answer_with_thinking(
                     "role": "system",
                     "content": (
                         "Answer the question using only the retrieval evidence and draft answer. "
-                        "Be concise. Preserve document/node citations if present."
+                        "Aim for a comprehensive yet accessible answer: preserve the depth, "
+                        "structure, specific figures, and supporting points already present in "
+                        "the draft, but reorganize for clarity — short paragraphs, headings or "
+                        "bullets where they aid scanability, and plain language alongside any "
+                        "technical terms. Correct factual errors against the evidence and keep "
+                        "all document/node citations. Do not shorten by dropping content; only "
+                        "trim genuine redundancy."
                     ),
                 },
                 {
