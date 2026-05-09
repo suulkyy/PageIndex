@@ -553,7 +553,6 @@ def list_to_tree(data):
         parts = str(structure).split('.')
         return '.'.join(parts[:-1]) if len(parts) > 1 else None
 
-    # First pass: Create nodes and track parent-child relationships
     nodes = {}
     root_nodes = []
 
@@ -563,35 +562,78 @@ def list_to_tree(data):
             'title': item.get('title'),
             'start_index': item.get('start_index'),
             'end_index': item.get('end_index'),
-            'nodes': []
+            'nodes': [],
         }
-
         nodes[structure] = node
 
-        # Find parent
         parent_structure = get_parent_structure(structure)
-
-        if parent_structure:
-            # Add as child to parent if parent exists
-            if parent_structure in nodes:
-                nodes[parent_structure]['nodes'].append(node)
-            else:
-                root_nodes.append(node)
-        else:
-            # No parent, this is a root node
+        if not parent_structure:
             root_nodes.append(node)
+            continue
 
-    # Helper function to clean empty children arrays
-    def clean_node(node):
-        if not node['nodes']:
-            del node['nodes']
-        else:
-            for child in node['nodes']:
-                clean_node(child)
+        # Direct-parent fast path — the common case for short, well-formed
+        # docs where the LLM emits every level of the numbering.
+        if parent_structure in nodes:
+            nodes[parent_structure]['nodes'].append(node)
+            continue
+
+        # Direct parent missing. Walk up the prefix chain until we find an
+        # existing ancestor (e.g. "8.7.3.1" → look for "8.7.3" → "8.7" →
+        # "8"). When the LLM emitted a chapter but skipped intermediate
+        # subsections — common in process_no_toc on long books where
+        # section title pages straddle chunk boundaries — synthesize
+        # placeholder nodes for the gap so subsections still nest under
+        # their chapter instead of orphaning to the root.
+        chain = [parent_structure]
+        cur = get_parent_structure(parent_structure)
+        while cur and cur not in nodes:
+            chain.append(cur)
+            cur = get_parent_structure(cur)
+
+        if cur is None:
+            # No ancestor exists at all — don't fabricate a wrapper chain
+            # around a lone orphan. Attach to root, matching the original
+            # behavior for the no-context case.
+            root_nodes.append(node)
+            continue
+
+        # Synthesize missing intermediates between `cur` (deepest existing
+        # ancestor) and the orphan. Mark with `_synthesized` so finalize()
+        # can recompute their span from descendants once all real children
+        # have been attached.
+        parent = nodes[cur]
+        for synth_structure in reversed(chain):
+            synth_node = {
+                'title': f"Section {synth_structure}",
+                'start_index': node['start_index'],
+                'end_index': node['end_index'],
+                'nodes': [],
+                '_synthesized': True,
+            }
+            nodes[synth_structure] = synth_node
+            parent['nodes'].append(synth_node)
+            parent = synth_node
+        parent['nodes'].append(node)
+
+    def finalize(node):
+        children = node.get('nodes') or []
+        for child in children:
+            finalize(child)
+        # Synthesized ancestors initially carry the first orphan's span.
+        # Recompute from the full set of descendants now that sibling
+        # subsections have been attached.
+        if node.pop('_synthesized', False) and children:
+            starts = [c.get('start_index') for c in children if isinstance(c.get('start_index'), int)]
+            ends = [c.get('end_index') for c in children if isinstance(c.get('end_index'), int)]
+            if starts:
+                node['start_index'] = min(starts)
+            if ends:
+                node['end_index'] = max(ends)
+        if not children:
+            node.pop('nodes', None)
         return node
 
-    # Clean and return the tree
-    return [clean_node(node) for node in root_nodes]
+    return [finalize(node) for node in root_nodes]
 
 def add_preface_if_needed(data):
     if not isinstance(data, list) or not data:
