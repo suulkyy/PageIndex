@@ -552,11 +552,11 @@ def list_to_tree(data):
             return None
         parts = str(structure).split('.')
         return '.'.join(parts[:-1]) if len(parts) > 1 else None
-    
+
     # First pass: Create nodes and track parent-child relationships
     nodes = {}
     root_nodes = []
-    
+
     for item in data:
         structure = item.get('structure')
         node = {
@@ -565,12 +565,12 @@ def list_to_tree(data):
             'end_index': item.get('end_index'),
             'nodes': []
         }
-        
+
         nodes[structure] = node
-        
+
         # Find parent
         parent_structure = get_parent_structure(structure)
-        
+
         if parent_structure:
             # Add as child to parent if parent exists
             if parent_structure in nodes:
@@ -580,7 +580,7 @@ def list_to_tree(data):
         else:
             # No parent, this is a root node
             root_nodes.append(node)
-    
+
     # Helper function to clean empty children arrays
     def clean_node(node):
         if not node['nodes']:
@@ -589,7 +589,7 @@ def list_to_tree(data):
             for child in node['nodes']:
                 clean_node(child)
         return node
-    
+
     # Clean and return the tree
     return [clean_node(node) for node in root_nodes]
 
@@ -810,24 +810,143 @@ def add_node_text_with_labels(node, pdf_pages):
     return
 
 
-async def generate_node_summary(node, model=None):
-    prompt = f"""You are given a part of a document, your task is to generate a description of the partial document about what are main points covered in the partial document.
+_NODE_SUMMARY_PROMPT = (
+    "You are given a part of a document, your task is to generate a description "
+    "of the partial document about what are main points covered in the partial "
+    "document.\n\n"
+    "Partial Document Text: {body}\n\n"
+    "Directly return the description, do not include any other text."
+)
+# Empirical token cost of the prompt scaffolding around {body}.
+_NODE_SUMMARY_PROMPT_OVERHEAD = 80
 
-    Partial Document Text: {node['text']}
-    
-    Directly return the description, do not include any other text.
+
+def _node_summary_budget(model):
+    """Token budget for the {body} payload of a node-summary prompt.
+    Returns None when the model's context is large enough that we don't
+    need to chunk (OpenAI/Anthropic) — preserves the original single-call
+    behavior on those providers."""
+    if not model:
+        return None
+    if not model.removeprefix("litellm/").startswith(("vllm/", "hosted_vllm/")):
+        return None
+    model_len = get_llm_runtime_int("vllm_max_model_len", ("VLLM_MAX_MODEL_LEN",), 16384)
+    output_cap = get_llm_runtime_int("vllm_max_tokens", ("VLLM_MAX_TOKENS",), 2048) or 2048
+    margin = get_llm_runtime_int("vllm_ctx_margin", ("VLLM_CTX_MARGIN",), 256)
+    # 256 tokens reserved for chat-template framing (mirrors generate_doc_description).
+    raw = model_len - output_cap - margin - 256 - _NODE_SUMMARY_PROMPT_OVERHEAD
+    return max(1024, raw)
+
+
+def _split_text_for_token_budget(text, budget_tokens, model):
+    """Split `text` into chunks that each fit `budget_tokens`.
+
+    Splits proportionally by characters (page text density is roughly uniform
+    within a node), then snaps each cut to the nearest paragraph break inside
+    the second half of the slice when one exists. Oversplits by ~15% so token
+    counts that drift slightly above the char-proportion estimate still fit.
     """
-    response = await llm_acompletion(model, prompt)
-    return response
+    if not text or budget_tokens is None or budget_tokens <= 0:
+        return [text]
+    total_tokens = count_tokens(text, model=model) or 0
+    if total_tokens <= budget_tokens:
+        return [text]
+    # Oversplit safety factor: chars-per-token can vary ~10-20% on technical text.
+    target_tokens = max(512, int(budget_tokens * 0.85))
+    n_chunks = max(2, (total_tokens + target_tokens - 1) // target_tokens)
+    approx_chars = max(1, len(text) // n_chunks)
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + approx_chars)
+        if end < len(text):
+            # Snap to a paragraph or sentence boundary if one is reachable
+            # in the back half of the slice — prevents mid-word/mid-sentence cuts.
+            mid = start + approx_chars // 2
+            for sep in ("\n\n", "\n", ". "):
+                idx = text.rfind(sep, mid, end)
+                if idx > start:
+                    end = idx + len(sep)
+                    break
+        chunks.append(text[start:end])
+        start = end
+    return chunks
+
+
+async def _summarize_text(text, model):
+    prompt = _NODE_SUMMARY_PROMPT.format(body=text)
+    return await llm_acompletion(model, prompt)
+
+
+async def generate_node_summary(node, model=None):
+    text = node.get('text') or ''
+    budget = _node_summary_budget(model)
+
+    if budget is None or (count_tokens(text, model=model) or 0) <= budget:
+        return await _summarize_text(text, model)
+
+    # Map: summarize each chunk that fits the budget.
+    chunks = _split_text_for_token_budget(text, budget, model)
+    chunk_summaries = await asyncio.gather(
+        *[_summarize_text(c, model) for c in chunks],
+        return_exceptions=True,
+    )
+    valid = [s for s in chunk_summaries if isinstance(s, str) and s.strip()]
+    if not valid:
+        # All chunk calls failed — surface the original error to the caller
+        # so generate_summaries_for_structure can apply its head-only fallback.
+        first_exc = next((e for e in chunk_summaries if isinstance(e, Exception)), None)
+        if first_exc is not None:
+            raise first_exc
+        return ""
+
+    # Reduce: summarize the concatenated chunk summaries. If they themselves
+    # overflow (only possible on extremely large nodes with verbose chunk
+    # outputs), one more map-reduce pass over the summaries.
+    reduced = "\n\n".join(valid)
+    if (count_tokens(reduced, model=model) or 0) <= budget:
+        return await _summarize_text(reduced, model)
+
+    sub_chunks = _split_text_for_token_budget(reduced, budget, model)
+    sub_summaries = await asyncio.gather(
+        *[_summarize_text(sc, model) for sc in sub_chunks],
+        return_exceptions=True,
+    )
+    sub_valid = [s for s in sub_summaries if isinstance(s, str) and s.strip()]
+    if not sub_valid:
+        return reduced  # Best-effort — return the unreduced concatenation.
+    final_input = "\n\n".join(sub_valid)
+    if (count_tokens(final_input, model=model) or 0) > budget:
+        return final_input  # Pathological: skip the final reduce, keep the text.
+    return await _summarize_text(final_input, model)
 
 
 async def generate_summaries_for_structure(structure, model=None):
     nodes = structure_to_list(structure)
     tasks = [generate_node_summary(node, model=model) for node in nodes]
-    summaries = await asyncio.gather(*tasks)
-    
-    for node, summary in zip(nodes, summaries):
-        node['summary'] = summary
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    log = logging.getLogger(__name__)
+    failed = 0
+    for node, result in zip(nodes, results):
+        if isinstance(result, Exception):
+            failed += 1
+            log.warning(
+                "node summary failed for node_id=%s title=%r: %s",
+                node.get('node_id'), (node.get('title') or '')[:80], result,
+            )
+            # Head-only fallback so the `summary` field is always populated
+            # and downstream code (format_structure, doc_description) keeps
+            # working. Bounded to avoid re-overflowing any later prompt.
+            text = node.get('text') or ''
+            node['summary'] = text[:1500]
+        else:
+            node['summary'] = result
+    if failed:
+        log.warning(
+            "generate_summaries_for_structure: %d/%d node summaries failed; head-only fallback applied",
+            failed, len(nodes),
+        )
     return structure
 
 
