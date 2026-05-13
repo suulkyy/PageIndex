@@ -40,7 +40,6 @@ Tuned for the dedicated remote LLM box at `<VLLM_HOST>` (2× Quadro RTX 5000, Tu
 vllm serve cyankiwi/Qwen3.6-27B-AWQ-INT4 \
     --tensor-parallel-size 2 \
     --dtype float16 \
-    --quantization awq_marlin \
     --max-model-len 65536 \
     --max-num-seqs 8 \
     --max-num-batched-tokens 8192 \
@@ -57,6 +56,7 @@ vllm serve cyankiwi/Qwen3.6-27B-AWQ-INT4 \
 
 Key points vs older Qwen3.5-9B recipe:
 - **No YARN.** Qwen3.6 has 262k native context; `--max-model-len 65536` is well inside it. No `--hf-overrides rope_scaling` needed.
+- **No `--quantization` flag.** This build is packaged as `compressed-tensors` W4A16, not legacy AWQ. vLLM auto-detects from `config.json` and picks the Marlin INT4 kernel on Turing. Passing `--quantization awq_marlin` trips a mismatch check (`Quantization method specified in the model config (compressed-tensors) does not match the quantization method specified in the quantization argument`). Use `--quantization compressed-tensors` explicitly if you want belt-and-suspenders, but auto-detect is the simpler path and survives future model swaps.
 - **AWQ-INT4 (~14 GB total weight)** leaves comfortable KV headroom on 2× 16 GB cards even at full `--gpu-memory-utilization 0.92` (LLM is the sole occupant; embedding + reranker live on a separate laptop GPU).
 - **`qwen3_coder` is the correct tool parser** for the Qwen3.5/3.6 dense family (per vLLM's Qwen3.5 recipe). Don't swap to `hermes` — that's for Qwen3-Next-80B-A3B MoE.
 - Tree-build/tool-loop turns disable thinking via `extra_body={"chat_template_kwargs":{"enable_thinking": false}}` (handled in `pageindex/utils.py:_provider_kwargs` and `retrieve_pageindex.py`). The `--reasoning-parser qwen3` flag is kept because vLLM's recipe recommends it; client-side per-request opt-outs are the intended pattern.
