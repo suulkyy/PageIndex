@@ -30,45 +30,73 @@ pip3 install json-repair          # required by extract_json fallback path
 
 `pyproject.toml` declares `requires-python = ">=3.12"`. Run scripts via `uv run python <script.py>` (bare `python3` misses uv-managed deps like `python-dotenv`, `litellm`, `json-repair`).
 
-`.env` (gitignored via `.env*`) must contain at least `OPENAI_API_KEY` (alias `CHATGPT_API_KEY` accepted). Multi-provider routing goes through LiteLLM, so any `provider/model` string LiteLLM supports works (e.g. `anthropic/claude-sonnet-4-6`).
+`.env` is gitignored via `.env*`; a tracked template lives at `env.example` (no leading dot, otherwise the glob would catch it) — copy to `.env` and fill in `<VLLM_HOST>`. `.env` must contain at least `OPENAI_API_KEY` (alias `CHATGPT_API_KEY` accepted) when using hosted OpenAI; for local vLLM/Ollama the `VLLM_API_KEY`/`OLLAMA_API_KEY` placeholders in `env.example` are sufficient. Multi-provider routing goes through LiteLLM, so any `provider/model` string LiteLLM supports works (e.g. `anthropic/claude-sonnet-4-6`).
 
-### Sample `.env` for a remote vLLM (Qwen3.5-9B at `--max-model-len 65536`)
+### Sample `.env` for a remote vLLM (Qwen3.6-27B-AWQ-INT4 at `--max-model-len 65536`)
 
-Tuned for `vllm serve Qwen/Qwen3.5-9B --max-model-len 65536 --max-num-seqs 16 --enable-prefix-caching --enable-auto-tool-choice --reasoning-parser qwen3 --tool-call-parser qwen3_coder` (YARN factor 2.0). Tree-build half is sized to keep prompts under context; retrieval half is Pareto-tuned for quality + latency on single-question runs.
+Tuned for the dedicated remote LLM box at `<VLLM_HOST>` (2× Quadro RTX 5000, Turing CC 7.5, 32 GB total):
+
+```bash
+vllm serve cyankiwi/Qwen3.6-27B-AWQ-INT4 \
+    --tensor-parallel-size 2 \
+    --dtype float16 \
+    --quantization awq_marlin \
+    --max-model-len 65536 \
+    --max-num-seqs 8 \
+    --max-num-batched-tokens 8192 \
+    --enable-chunked-prefill \
+    --enable-prefix-caching \
+    --gpu-memory-utilization 0.92 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --trust-remote-code \
+    --host 0.0.0.0 --port 8000 \
+    --served-model-name rag-llm
+```
+
+Key points vs older Qwen3.5-9B recipe:
+- **No YARN.** Qwen3.6 has 262k native context; `--max-model-len 65536` is well inside it. No `--hf-overrides rope_scaling` needed.
+- **AWQ-INT4 (~14 GB total weight)** leaves comfortable KV headroom on 2× 16 GB cards even at full `--gpu-memory-utilization 0.92` (LLM is the sole occupant; embedding + reranker live on a separate laptop GPU).
+- **`qwen3_coder` is the correct tool parser** for the Qwen3.5/3.6 dense family (per vLLM's Qwen3.5 recipe). Don't swap to `hermes` — that's for Qwen3-Next-80B-A3B MoE.
+- Tree-build/tool-loop turns disable thinking via `extra_body={"chat_template_kwargs":{"enable_thinking": false}}` (handled in `pageindex/utils.py:_provider_kwargs` and `retrieve_pageindex.py`). The `--reasoning-parser qwen3` flag is kept because vLLM's recipe recommends it; client-side per-request opt-outs are the intended pattern.
+
+Sample `.env`:
 
 ```bash
 # ─── Tree-build (run_pageindex.py / run_pageindex_verbose.py) ──────────────
 VLLM_API_BASE=http://<VLLM_HOST>:8000/v1
 VLLM_TIMEOUT=3600
-PAGEINDEX_LLM_CONCURRENCY=16
+PAGEINDEX_LLM_CONCURRENCY=8                  # match remote --max-num-seqs 8 to avoid KV preemption
 VLLM_MAX_TOKENS=1024
 VLLM_MAX_MODEL_LEN=65536
 VLLM_CTX_MARGIN=1024
 # VLLM_ENABLE_THINKING=true   # leave off — tree-build is JSON-only; thinking inflates wall-clock 2-4x with no quality gain
 
-# ─── Retrieval (retrieve_pageindex.py) — Pareto-tuned for quality + latency ─
-# Tool-loop turns are forced non-thinking (qwen3 reasoning-parser routes tool
-# intent into `reasoning`, breaking tool calls). Final-answer refinement runs
-# as a separate vLLM call with thinking enabled when
-# PAGEINDEX_RETRIEVE_ENABLE_THINKING=true. That single extra call buys
-# CoT-refined output for ~5-15s of latency — the biggest quality lever per Q.
+# ─── Retrieval (retrieve_pageindex.py) ──────────────────────────────────────
+VLLM_BASE_URL=http://<VLLM_HOST>:8000/v1     # retrieval reads VLLM_BASE_URL (with /v1), not VLLM_API_BASE
+VLLM_API_KEY=EMPTY                           # AsyncOpenAI requires non-empty; vLLM ignores value
 
-VLLM_BASE_URL=http://<VLLM_HOST>:8000/v1   # retrieval reads VLLM_BASE_URL (with /v1), not VLLM_API_BASE
-VLLM_API_KEY=EMPTY                         # AsyncOpenAI requires non-empty; vLLM ignores value
+PAGEINDEX_AGENT_MAX_TURNS=20                 # caps runaway loops; books rarely need >15 turns
 
-PAGEINDEX_RETRIEVE_ENABLE_THINKING=true    # final answer goes through CoT refinement → biggest quality win
-PAGEINDEX_AGENT_MAX_TOKENS=8192            # needed so qwen3 thinking trace + final answer both fit per turn
-PAGEINDEX_AGENT_MAX_TURNS=30               # default — enough for textbook questions, caps runaway loops
+# Bounded tool-output sizes — prevents the rolling agent history from
+# overflowing 65k. The earlier 30,721-token retrieval failure on the annual-
+# report PDF was caused by uncapped structure summaries; these defaults
+# stop it from recurring.
+PAGEINDEX_NODE_TEXT_MAX_CHARS=12000
+PAGEINDEX_STRUCTURE_SUMMARY_MAX_CHARS=120
+PAGEINDEX_RETRIEVE_THINKING_EVIDENCE_MAX_CHARS=20000
+PAGEINDEX_TOOL_LOG_MAX_CHARS=4000
 
-PAGEINDEX_NODE_TEXT_MAX_CHARS=16000        # 2× default; richer grounding for hard questions, fits in 65k window
-PAGEINDEX_STRUCTURE_SUMMARY_MAX_CHARS=300  # ~2× default; agent picks the right node sooner → fewer wasted turns (also throughput win)
-PAGEINDEX_RETRIEVE_THINKING_EVIDENCE_MAX_CHARS=20000  # more evidence into CoT pass → better refinement
-PAGEINDEX_TOOL_LOG_MAX_CHARS=4000          # log-file cap only; no quality/throughput effect
-
-# ─── Throughput-only profile (uncomment to disable thinking, ~5-15s faster per Q) ─
-# PAGEINDEX_RETRIEVE_ENABLE_THINKING=false
-# PAGEINDEX_AGENT_MAX_TOKENS=2048
+# ─── Default: throughput profile, no thinking on final answer ───────────────
+# Flip both to enable CoT-refined answers (+5–15 s/query, biggest quality lever):
+#   PAGEINDEX_RETRIEVE_ENABLE_THINKING=true
+#   PAGEINDEX_AGENT_MAX_TOKENS=8192
+PAGEINDEX_RETRIEVE_ENABLE_THINKING=false
+PAGEINDEX_AGENT_MAX_TOKENS=2048
 ```
+
+Pass `--model hosted_vllm/rag-llm` to `run_pageindex.py` and `--provider vllm --model rag-llm` to `retrieve_pageindex.py` — both pick up the URL from `.env` so no `--base-url` is needed.
 
 Two-name gotcha: `VLLM_API_BASE` is read by the **tree-build** path (`pageindex/utils.py:_provider_kwargs`), `VLLM_BASE_URL` (with `/v1`) is read by the **retrieval** path (`retrieve_pageindex.py`). Set both to the same URL so either script works without `--base-url`.
 
