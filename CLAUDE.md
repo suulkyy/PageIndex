@@ -43,7 +43,6 @@ vllm serve cyankiwi/Qwen3.6-27B-AWQ-INT4 \
     --max-model-len 65536 \
     --max-num-seqs 8 \
     --max-num-batched-tokens 8192 \
-    --enable-chunked-prefill \
     --enable-prefix-caching \
     --gpu-memory-utilization 0.92 \
     --enable-auto-tool-choice \
@@ -56,6 +55,7 @@ vllm serve cyankiwi/Qwen3.6-27B-AWQ-INT4 \
 
 Key points vs older Qwen3.5-9B recipe:
 - **No YARN.** Qwen3.6 has 262k native context; `--max-model-len 65536` is well inside it. No `--hf-overrides rope_scaling` needed.
+- **No `--enable-chunked-prefill`.** vLLM 0.20.x V1 engine forces chunked prefill on; the flag is silently ignored (and `--no-enable-chunked-prefill` errors). Drop it for cleanness.
 - **No `--quantization` flag.** This build is packaged as `compressed-tensors` W4A16, not legacy AWQ. vLLM auto-detects from `config.json` and picks the Marlin INT4 kernel on Turing. Passing `--quantization awq_marlin` trips a mismatch check (`Quantization method specified in the model config (compressed-tensors) does not match the quantization method specified in the quantization argument`). Use `--quantization compressed-tensors` explicitly if you want belt-and-suspenders, but auto-detect is the simpler path and survives future model swaps.
 - **AWQ-INT4 (~14 GB total weight)** leaves comfortable KV headroom on 2× 16 GB cards even at full `--gpu-memory-utilization 0.92` (LLM is the sole occupant; embedding + reranker live on a separate laptop GPU).
 - **`qwen3_coder` is the correct tool parser** for the Qwen3.5/3.6 dense family (per vLLM's Qwen3.5 recipe). Don't swap to `hermes` — that's for Qwen3-Next-80B-A3B MoE.
