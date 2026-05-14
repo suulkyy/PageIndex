@@ -948,6 +948,7 @@ def query_agent(
 ) -> str:
     try:
         from agents import Agent, Runner, RunConfig, function_tool, set_tracing_disabled
+        from agents.exceptions import MaxTurnsExceeded
         from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
         from openai.types.responses import (
             ResponseTextDeltaEvent,
@@ -1087,51 +1088,65 @@ def query_agent(
         )
         current_kind = None
         tool_outputs_for_refine = []
-        async for event in streamed_run.stream_events():
-            if isinstance(event, RawResponsesStreamEvent):
-                if isinstance(event.data, ResponseReasoningSummaryTextDeltaEvent):
-                    if current_kind != "reasoning":
+        max_turns_hit = False
+        try:
+            async for event in streamed_run.stream_events():
+                if isinstance(event, RawResponsesStreamEvent):
+                    if isinstance(event.data, ResponseReasoningSummaryTextDeltaEvent):
+                        if current_kind != "reasoning":
+                            if current_kind is not None:
+                                print()
+                            print("\n[reasoning]: ", end="", flush=True)
+                        print(event.data.delta, end="", flush=True)
+                        current_kind = "reasoning"
+                    elif isinstance(event.data, ResponseTextDeltaEvent):
+                        if current_kind != "text":
+                            if current_kind is not None:
+                                print()
+                            print("\n[text]: ", end="", flush=True)
+                        print(event.data.delta, end="", flush=True)
+                        current_kind = "text"
+                elif isinstance(event, RunItemStreamEvent):
+                    item = event.item
+                    if item.type == "tool_call_item":
                         if current_kind is not None:
                             print()
-                        print("\n[reasoning]: ", end="", flush=True)
-                    print(event.data.delta, end="", flush=True)
-                    current_kind = "reasoning"
-                elif isinstance(event.data, ResponseTextDeltaEvent):
-                    if current_kind != "text":
-                        if current_kind is not None:
-                            print()
-                        print("\n[text]: ", end="", flush=True)
-                    print(event.data.delta, end="", flush=True)
-                    current_kind = "text"
-            elif isinstance(event, RunItemStreamEvent):
-                item = event.item
-                if item.type == "tool_call_item":
-                    if current_kind is not None:
-                        print()
-                    raw = item.raw_item
-                    args = getattr(raw, "arguments", "{}")
-                    args_str = f"({args})" if verbose else ""
-                    print(f"\n[tool call]: {raw.name}{args_str}", flush=True)
-                    logger.info("agent tool_call: %s args=%s", raw.name, args)
-                    current_kind = None
-                elif item.type == "tool_call_output_item":
-                    output = str(item.output)
-                    tool_outputs_for_refine.append(output)
-                    preview = output[:200] + "..." if len(output) > 200 else output
-                    # Log full output to file; keep stdout preview short.
-                    log_cap = _env_int("PAGEINDEX_TOOL_LOG_MAX_CHARS", 4000)
-                    logged_output = output if log_cap <= 0 else output[:log_cap]
-                    if log_cap > 0 and len(output) > log_cap:
-                        logged_output += f"... [truncated from {len(output)} chars]"
-                    logger.info("agent tool_output (%d chars): %s", len(output), logged_output)
-                    if verbose:
-                        if current_kind is not None:
-                            print()
-                        print(f"\n[tool call output]: {preview}", flush=True)
+                        raw = item.raw_item
+                        args = getattr(raw, "arguments", "{}")
+                        args_str = f"({args})" if verbose else ""
+                        print(f"\n[tool call]: {raw.name}{args_str}", flush=True)
+                        logger.info("agent tool_call: %s args=%s", raw.name, args)
                         current_kind = None
+                    elif item.type == "tool_call_output_item":
+                        output = str(item.output)
+                        tool_outputs_for_refine.append(output)
+                        preview = output[:200] + "..." if len(output) > 200 else output
+                        # Log full output to file; keep stdout preview short.
+                        log_cap = _env_int("PAGEINDEX_TOOL_LOG_MAX_CHARS", 4000)
+                        logged_output = output if log_cap <= 0 else output[:log_cap]
+                        if log_cap > 0 and len(output) > log_cap:
+                            logged_output += f"... [truncated from {len(output)} chars]"
+                        logger.info("agent tool_output (%d chars): %s", len(output), logged_output)
+                        if verbose:
+                            if current_kind is not None:
+                                print()
+                            print(f"\n[tool call output]: {preview}", flush=True)
+                            current_kind = None
+        except MaxTurnsExceeded:
+            max_turns_hit = True
+            logger.warning(
+                "MaxTurnsExceeded after %d tool outputs; returning best-effort partial answer.",
+                len(tool_outputs_for_refine),
+            )
         if current_kind is not None:
             print()
         final = "" if not streamed_run.final_output else str(streamed_run.final_output)
+        if max_turns_hit and not final:
+            final = (
+                f"[Max agent turns reached before a final answer was produced. "
+                f"{len(tool_outputs_for_refine)} tool outputs were collected; "
+                f"consider raising PAGEINDEX_AGENT_MAX_TURNS or simplifying the question.]"
+            )
         if final and provider == "vllm" and answer_thinking:
             final = await _refine_vllm_answer_with_thinking(
                 model=bare_model,
@@ -1153,10 +1168,13 @@ def query_agent(
 
     try:
         asyncio.get_running_loop()
+        in_loop = True
+    except RuntimeError:
+        in_loop = False
+    if in_loop:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             return pool.submit(asyncio.run, _run()).result()
-    except RuntimeError:
-        return asyncio.run(_run())
+    return asyncio.run(_run())
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
