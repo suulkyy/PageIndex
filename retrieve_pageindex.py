@@ -209,11 +209,49 @@ def _max_line_num(structure) -> int:
     return max((n.get('line_num') or 0 for n in _iter_nodes(structure)), default=0)
 
 
-def _find_node_by_id(structure, node_id: str):
+def _find_node_by_id(structure, node_id):
+    """Look up a node by id, tolerating common LLM mistakes.
+
+    Accepts:
+      - the canonical zero-padded string ('0007', '1119')
+      - bare ints (7, 1119) — local Qwen3-class models routinely drop the
+        quotes when serializing tool-call JSON, so the schema is permissive
+        and resolution happens here.
+      - unpadded strings ('7') — same root cause as above; we pad to the
+        widths actually seen in the tree.
+    Returns None on miss; callers should hand back a suggestion list."""
+    if node_id is None or node_id == "":
+        return None
+    target = str(node_id).strip()
+    # Strip surrounding quotes weak models occasionally leave in ('"0007"').
+    if len(target) >= 2 and target[0] == target[-1] and target[0] in ("'", '"'):
+        target = target[1:-1]
+    candidates = {target}
+    widths = {len(n.get('node_id')) for n in _iter_nodes(structure)
+              if isinstance(n.get('node_id'), str)}
+    for w in widths:
+        if len(target) < w and target.isdigit():
+            candidates.add(target.zfill(w))
     for node in _iter_nodes(structure):
-        if node.get('node_id') == node_id:
+        if node.get('node_id') in candidates:
             return node
     return None
+
+
+def _suggest_node_ids(structure, node_id, limit: int = 5) -> list[str]:
+    """Closest existing node_ids by numeric distance, for not-found hints."""
+    target = str(node_id).strip().lstrip("\"'").rstrip("\"'")
+    if not target.isdigit():
+        return [n.get('node_id') for n in _iter_nodes(structure)
+                if isinstance(n.get('node_id'), str)][:limit]
+    target_int = int(target)
+    pairs: list[tuple[int, str]] = []
+    for n in _iter_nodes(structure):
+        nid = n.get('node_id')
+        if isinstance(nid, str) and nid.isdigit():
+            pairs.append((abs(int(nid) - target_int), nid))
+    pairs.sort()
+    return [nid for _, nid in pairs[:limit]]
 
 
 def _env_int(name: str, default: int) -> int:
@@ -436,7 +474,7 @@ def tool_get_document_structure(
     documents: dict,
     doc_id: str,
     max_depth: int | None = None,
-    from_node_id: str | None = None,
+    from_node_id: str | int | None = None,
 ) -> str:
     """Return a navigation-sized compact tree.
 
@@ -517,7 +555,7 @@ def tool_get_document_structure(
 def tool_get_node_content(
     documents: dict,
     doc_id: str,
-    node_id: str,
+    node_id: str | int,
     offset: int = 0,
     length: int | None = None,
 ) -> str:
