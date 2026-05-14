@@ -23,7 +23,10 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -57,6 +60,19 @@ os.environ["OLLAMA_THINK"] = "false"
 
 _OriginalJsonLogger = _pi_utils.JsonLogger
 _VERBOSE = True  # toggled by CLI
+
+# ── Phase 0: preflight + checkpoint + heartbeat state ─────────────────────────
+# Wrapper-only observability/safety. None of these mutate pipeline output.
+_CHECKPOINT_PATH = None
+_CHECKPOINT_LOCK = threading.Lock()
+_CURRENT_PHASE = None
+_CURRENT_PHASE_T0 = None
+_LLM_LOCK = threading.Lock()
+_LLM_DONE = 0
+_LLM_INFLIGHT = 0
+_LLM_LATENCY_SUM = 0.0
+_LLM_LATENCY_N = 0
+_HEARTBEAT_STOP = threading.Event()
 
 
 def _short(value, limit=400):
@@ -161,8 +177,15 @@ class _VerboseJsonLogger(_OriginalJsonLogger):
 
 _pi_utils.JsonLogger = _VerboseJsonLogger
 # Re-export under the names the package members already imported.
-import pageindex.page_index as _pi_pdf  # noqa: E402
-import pageindex.page_index_md as _pi_md  # noqa: E402
+# NOTE: `import pageindex.page_index as X` would bind X to the FUNCTION
+# `page_index` (re-exported by pageindex/__init__.py via `from .page_index
+# import *`), not the submodule — `import a.b as c` resolves via
+# `getattr(a, 'b')`. Reach into sys.modules to get the actual submodule.
+import importlib  # noqa: E402
+importlib.import_module("pageindex.page_index")
+importlib.import_module("pageindex.page_index_md")
+_pi_pdf = sys.modules["pageindex.page_index"]
+_pi_md = sys.modules["pageindex.page_index_md"]
 _pi_pdf.JsonLogger = _VerboseJsonLogger
 _pi_md.JsonLogger = _VerboseJsonLogger
 
@@ -171,15 +194,241 @@ _pi_md.JsonLogger = _VerboseJsonLogger
 
 @contextmanager
 def _phase(name: str):
+    global _CURRENT_PHASE, _CURRENT_PHASE_T0
     if _VERBOSE:
         print(f"\n[{_ts()}] === {name} ===", file=sys.stderr, flush=True)
-    t0 = time.perf_counter()
+    prev_phase, prev_t0 = _CURRENT_PHASE, _CURRENT_PHASE_T0
+    _CURRENT_PHASE = name
+    _CURRENT_PHASE_T0 = time.perf_counter()
+    t0 = _CURRENT_PHASE_T0
     try:
         yield
     finally:
         if _VERBOSE:
             dt = time.perf_counter() - t0
             print(f"[{_ts()}] === {name} done in {dt:.2f}s ===", file=sys.stderr, flush=True)
+        _CURRENT_PHASE, _CURRENT_PHASE_T0 = prev_phase, prev_t0
+
+
+# ── Phase 0: preflight, checkpoint hooks, LLM counters, heartbeat ─────────────
+
+def _preflight_vllm(model_str, base_url):
+    """Probe vLLM /v1/models for the served model's max_model_len; auto-clamp
+    the client-side runtime when the env/CLI value exceeds the server's.
+
+    Why: book2.pdf was bitten by env=65536 but server=32768 — every prompt
+    silently overflowed, LiteLLM retried 10× per call, then the pipeline
+    crashed with `vLLM prompt budget exceeded: headroom=-87029`. A 10s
+    HTTP probe at startup eliminates the entire failure class."""
+    if not model_str:
+        return
+    normalized = model_str.removeprefix("litellm/")
+    if not normalized.startswith(("vllm/", "hosted_vllm/")):
+        return
+    served_name = normalized.split("/", 1)[1]
+
+    if not base_url:
+        base_url = os.environ.get("VLLM_API_BASE") or os.environ.get("VLLM_BASE_URL")
+    if not base_url:
+        print(f"[{_ts()}] [preflight] no vLLM base URL; skipping",
+              file=sys.stderr, flush=True)
+        return
+    base = base_url.rstrip("/")
+    if not base.endswith("/v1"):
+        base = base + "/v1"
+    url = base + "/models"
+
+    try:
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer EMPTY"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        print(f"[{_ts()}] [preflight] {url} unreachable ({e}); skipping",
+              file=sys.stderr, flush=True)
+        return
+
+    models = data.get("data") or []
+    match = next((m for m in models if m.get("id") == served_name), None)
+    if match is None:
+        ids = [m.get("id") for m in models]
+        print(f"[{_ts()}] [preflight] '{served_name}' not served; available={ids}",
+              file=sys.stderr, flush=True)
+        return
+
+    server_max = match.get("max_model_len")
+    if not isinstance(server_max, int) or server_max <= 0:
+        print(f"[{_ts()}] [preflight] server did not report max_model_len for {served_name}",
+              file=sys.stderr, flush=True)
+        return
+
+    client_max = _pi_utils.get_llm_runtime_int(
+        "vllm_max_model_len", ("VLLM_MAX_MODEL_LEN",), 16384,
+    )
+    if client_max > server_max:
+        print(
+            f"[{_ts()}] [preflight] client vllm_max_model_len={client_max} > "
+            f"server={server_max} ({served_name}); auto-clamping",
+            file=sys.stderr, flush=True,
+        )
+        _pi_utils.configure_llm_runtime(vllm_max_model_len=server_max)
+        os.environ["VLLM_MAX_MODEL_LEN"] = str(server_max)
+    else:
+        print(
+            f"[{_ts()}] [preflight] client={client_max} ≤ server={server_max} "
+            f"({served_name}) — OK",
+            file=sys.stderr, flush=True,
+        )
+
+
+def _checkpoint(structure, stage_name, extras=None):
+    """Atomic JSON snapshot of the partial tree. No-op when path not set."""
+    if not _CHECKPOINT_PATH:
+        return
+    try:
+        payload = {"_partial": True, "_stage": stage_name, "_ts": _ts()}
+        if isinstance(extras, dict):
+            payload.update(extras)
+        payload["structure"] = structure
+        tmp = _CHECKPOINT_PATH + ".tmp"
+        with _CHECKPOINT_LOCK:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, default=str)
+            os.replace(tmp, _CHECKPOINT_PATH)
+        print(f"[{_ts()}] [checkpoint] {stage_name} → {_CHECKPOINT_PATH}",
+              file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[{_ts()}] [checkpoint-error] {stage_name}: {e}",
+              file=sys.stderr, flush=True)
+
+
+def _install_checkpoint_hooks():
+    """Decorate each top-level pipeline stage so a partial tree lands on
+    disk after every irreversible step. Originals are called first; only
+    the side-effect of writing JSON is added — pipeline output unchanged."""
+    # `pageindex.page_index` (attribute on the package) is the FUNCTION
+    # exported via `from .page_index import *` in __init__.py — not the
+    # submodule. Reach into sys.modules for the actual module object so
+    # rebinds take effect.
+    _pi = sys.modules["pageindex.page_index"]
+
+    orig_tree_parser = _pi.tree_parser
+    orig_write_id = _pi.write_node_id
+    orig_add_text = _pi.add_node_text
+    orig_gen_summaries = _pi.generate_summaries_for_structure
+    orig_gen_desc = _pi.generate_doc_description
+
+    async def _tree_parser_with_ckpt(*a, **kw):
+        result = await orig_tree_parser(*a, **kw)
+        _checkpoint(result, "tree_parser")
+        return result
+
+    def _write_id_with_ckpt(structure, *a, **kw):
+        ret = orig_write_id(structure, *a, **kw)
+        _checkpoint(structure, "write_node_id")
+        return ret
+
+    def _add_text_with_ckpt(structure, *a, **kw):
+        ret = orig_add_text(structure, *a, **kw)
+        _checkpoint(structure, "add_node_text")
+        return ret
+
+    async def _gen_summaries_with_ckpt(structure, *a, **kw):
+        ret = await orig_gen_summaries(structure, *a, **kw)
+        _checkpoint(structure, "generate_summaries_for_structure")
+        return ret
+
+    def _gen_desc_with_ckpt(clean_structure, *a, **kw):
+        ret = orig_gen_desc(clean_structure, *a, **kw)
+        _checkpoint(clean_structure, "generate_doc_description",
+                    extras={"doc_description": ret})
+        return ret
+
+    _pi.tree_parser = _tree_parser_with_ckpt
+    _pi.write_node_id = _write_id_with_ckpt
+    _pi.add_node_text = _add_text_with_ckpt
+    _pi.generate_summaries_for_structure = _gen_summaries_with_ckpt
+    _pi.generate_doc_description = _gen_desc_with_ckpt
+
+
+def _install_llm_counters():
+    """Instrument llm_completion / llm_acompletion in every module that
+    binds them, so the heartbeat can show rolling call counts + latency.
+    Both page_index modules star-import from utils, so the symbol must be
+    rebound in each (utils, page_index, page_index_md)."""
+    # See _install_checkpoint_hooks for why sys.modules is required.
+    _pi = sys.modules["pageindex.page_index"]
+    _pi_md_mod = sys.modules["pageindex.page_index_md"]
+
+    orig_sync = _pi_utils.llm_completion
+    orig_async = _pi_utils.llm_acompletion
+
+    def wrapped_sync(*a, **kw):
+        global _LLM_DONE, _LLM_INFLIGHT, _LLM_LATENCY_SUM, _LLM_LATENCY_N
+        with _LLM_LOCK:
+            _LLM_INFLIGHT += 1
+        t0 = time.perf_counter()
+        try:
+            return orig_sync(*a, **kw)
+        finally:
+            dt = time.perf_counter() - t0
+            with _LLM_LOCK:
+                _LLM_INFLIGHT -= 1
+                _LLM_DONE += 1
+                _LLM_LATENCY_SUM += dt
+                _LLM_LATENCY_N += 1
+
+    async def wrapped_async(*a, **kw):
+        global _LLM_DONE, _LLM_INFLIGHT, _LLM_LATENCY_SUM, _LLM_LATENCY_N
+        with _LLM_LOCK:
+            _LLM_INFLIGHT += 1
+        t0 = time.perf_counter()
+        try:
+            return await orig_async(*a, **kw)
+        finally:
+            dt = time.perf_counter() - t0
+            with _LLM_LOCK:
+                _LLM_INFLIGHT -= 1
+                _LLM_DONE += 1
+                _LLM_LATENCY_SUM += dt
+                _LLM_LATENCY_N += 1
+
+    for mod in (_pi_utils, _pi, _pi_md_mod):
+        if getattr(mod, "llm_completion", None) is not None:
+            mod.llm_completion = wrapped_sync
+        if getattr(mod, "llm_acompletion", None) is not None:
+            mod.llm_acompletion = wrapped_async
+
+
+def _heartbeat_loop(interval):
+    while not _HEARTBEAT_STOP.wait(interval):
+        try:
+            phase = _CURRENT_PHASE
+            elapsed = (time.perf_counter() - _CURRENT_PHASE_T0) if _CURRENT_PHASE_T0 else 0.0
+            with _LLM_LOCK:
+                done = _LLM_DONE
+                inflight = _LLM_INFLIGHT
+                avg_ms = (_LLM_LATENCY_SUM / _LLM_LATENCY_N * 1000.0) if _LLM_LATENCY_N else 0.0
+            print(
+                f"[{_ts()}] [heartbeat] phase={phase or 'idle'} elapsed={elapsed:.1f}s "
+                f"llm_done={done} llm_inflight={inflight} avg_ms={avg_ms:.0f}",
+                file=sys.stderr, flush=True,
+            )
+        except Exception as e:
+            print(f"[{_ts()}] [heartbeat-error] {e}", file=sys.stderr, flush=True)
+
+
+def _start_heartbeat(interval=15.0):
+    _HEARTBEAT_STOP.clear()
+    t = threading.Thread(
+        target=_heartbeat_loop, args=(interval,),
+        daemon=True, name="pageindex-heartbeat",
+    )
+    t.start()
+    return t
+
+
+def _stop_heartbeat():
+    _HEARTBEAT_STOP.set()
 
 
 # ── Patched page_index_main / md_to_tree wrappers ─────────────────────────────
@@ -308,17 +557,39 @@ def main():
         if _VERBOSE:
             print(f"[{_ts()}] [config] {vars(opt)}", file=sys.stderr, flush=True)
 
-        with _phase(f"PDF pipeline: {args.pdf_path}"):
-            result = _page_index_main(args.pdf_path, opt)
+        # Phase 0.1 — preflight the vLLM server (no-op for non-vLLM models).
+        _preflight_vllm(opt.model, args.base_url)
 
         pdf_name = os.path.splitext(os.path.basename(args.pdf_path))[0]
         output_dir = './results'
         output_file = f'{output_dir}/{pdf_name}_structure.json'
         os.makedirs(output_dir, exist_ok=True)
 
-        with _phase(f"Save → {output_file}"):
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(result, f, indent=2)
+        # Phase 0.2 — wire stage checkpointing before the pipeline runs.
+        global _CHECKPOINT_PATH
+        _CHECKPOINT_PATH = f'{output_dir}/{pdf_name}_structure.partial.json'
+        _install_checkpoint_hooks()
+
+        # Phase 0.3 — instrument LLM calls + start heartbeat thread.
+        _install_llm_counters()
+        _start_heartbeat(interval=15.0)
+
+        try:
+            with _phase(f"PDF pipeline: {args.pdf_path}"):
+                result = _page_index_main(args.pdf_path, opt)
+
+            with _phase(f"Save → {output_file}"):
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    json.dump(result, f, indent=2)
+        finally:
+            _stop_heartbeat()
+
+        # Final artifact landed; the partial checkpoint is now stale.
+        try:
+            if _CHECKPOINT_PATH and os.path.exists(_CHECKPOINT_PATH):
+                os.remove(_CHECKPOINT_PATH)
+        except OSError:
+            pass
 
         print(f'Tree structure saved to: {output_file}')
 
@@ -342,27 +613,37 @@ def main():
         if _VERBOSE:
             print(f"[{_ts()}] [config] {vars(opt)}", file=sys.stderr, flush=True)
 
-        with _phase(f"Markdown pipeline: {args.md_path}"):
-            result = asyncio.run(md_to_tree(
-                md_path=args.md_path,
-                if_thinning=args.if_thinning.lower() == 'yes',
-                min_token_threshold=args.thinning_threshold,
-                if_add_node_summary=opt.if_add_node_summary,
-                summary_token_threshold=args.summary_token_threshold,
-                model=opt.model,
-                if_add_doc_description=opt.if_add_doc_description,
-                if_add_node_text=opt.if_add_node_text,
-                if_add_node_id=opt.if_add_node_id,
-            ))
+        # Phase 0.1 — preflight (no-op for non-vLLM models).
+        _preflight_vllm(opt.model, args.base_url)
+        # Phase 0.3 — counters + heartbeat. Checkpointing hooks live on
+        # pageindex.page_index, not the markdown pipeline.
+        _install_llm_counters()
+        _start_heartbeat(interval=15.0)
 
-        md_name = os.path.splitext(os.path.basename(args.md_path))[0]
-        output_dir = './results'
-        output_file = f'{output_dir}/{md_name}_structure.json'
-        os.makedirs(output_dir, exist_ok=True)
+        try:
+            with _phase(f"Markdown pipeline: {args.md_path}"):
+                result = asyncio.run(md_to_tree(
+                    md_path=args.md_path,
+                    if_thinning=args.if_thinning.lower() == 'yes',
+                    min_token_threshold=args.thinning_threshold,
+                    if_add_node_summary=opt.if_add_node_summary,
+                    summary_token_threshold=args.summary_token_threshold,
+                    model=opt.model,
+                    if_add_doc_description=opt.if_add_doc_description,
+                    if_add_node_text=opt.if_add_node_text,
+                    if_add_node_id=opt.if_add_node_id,
+                ))
 
-        with _phase(f"Save → {output_file}"):
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(result, f, indent=2, ensure_ascii=False)
+            md_name = os.path.splitext(os.path.basename(args.md_path))[0]
+            output_dir = './results'
+            output_file = f'{output_dir}/{md_name}_structure.json'
+            os.makedirs(output_dir, exist_ok=True)
+
+            with _phase(f"Save → {output_file}"):
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    json.dump(result, f, indent=2, ensure_ascii=False)
+        finally:
+            _stop_heartbeat()
 
         print(f'Tree structure saved to: {output_file}')
 
