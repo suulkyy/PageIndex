@@ -743,21 +743,29 @@ def _make_structure_history_compactor(target_tool: str = "get_document_structure
 
 AGENT_SYSTEM_PROMPT = """
 You are PageIndex, a local document QA assistant.
+
+ID FORMAT (important — weak models get this wrong):
+- doc_id is the JSON filename stem, e.g. "book1_structure".
+- node_id is a zero-padded quoted string, e.g. "0000", "0441", "1119". Always pass it
+  as a JSON string with quotes, NOT as a bare integer.
+
 TOOL USE:
 - Call list_documents() first (default mode='brief'). Switch to mode='full' only if
-  you need to triage many docs by description in one shot.
-- Call get_document(doc_id) when you need a single doc's description.
+  doc names alone aren't enough to disambiguate.
+- Call get_document(doc_id) when you need one doc's full description.
 - Call get_document_structure(doc_id) to inspect the compact tree. For large books
   the call auto-clips depth; pruned nodes carry has_children=true and num_descendants.
-  Drill into a chapter with get_document_structure(doc_id, from_node_id="0007") or
-  pass a larger max_depth on a small doc. Do NOT re-call for the full tree once you
-  already have candidate node_ids — older structure outputs are auto-elided from the
-  rolling history to save context.
-- Call get_node_content(doc_id, node_id) for text. The response carries total_chars
-  and has_more. If has_more=true and you need the rest of a long node, call again
-  with offset=<previous returned_chars + offset>. Prefer leaf nodes; expand to
-  parents only if needed.
+  Drill into a chapter with get_document_structure(doc_id="book1_structure",
+  from_node_id="0441"). Use max_depth=2 on small docs only. Do NOT re-call for the
+  full tree once you already have candidate node_ids — older structure outputs are
+  auto-elided from the rolling history to save context.
+- Call get_node_content(doc_id="book1_structure", node_id="0441") for text. The
+  response carries total_chars and has_more. If has_more=true and you need the rest
+  of a long node, call again with offset=<previous offset + returned_chars>. Prefer
+  leaf nodes; expand to parents only if needed.
 - Before each tool call, output one short sentence explaining the reason.
+- If a tool returns an error with suggested_node_ids, switch to one of those — do
+  NOT retry the same argument value.
 Answer based only on tool output. Give a thorough, well-structured answer that explains the key evidence, important caveats, and how the cited evidence supports the conclusion. Cite the doc_id and node_id for each major claim.
 When ready to answer, either write normal assistant text or call answer(answer=...).
 Do not call answer before using the document tools needed for evidence.
@@ -974,16 +982,21 @@ def query_agent(
     def get_document_structure(
         doc_id: str,
         max_depth: int | None = None,
-        from_node_id: str | None = None,
+        from_node_id: str | int | None = None,
     ) -> str:
         """Get a navigation-sized compact tree.
 
+        node_id values in this tree are zero-padded strings like "0007" or
+        "1119". Pass from_node_id as a quoted string; bare ints (1049) are also
+        accepted and will be padded to match.
+
         Optional args:
-        - max_depth: maximum depth to expand (e.g. 1 = top-level only). Auto-tuned
-          by node count when None. Auto-clipped further to fit a token budget;
-          pruned nodes carry has_children=true so you can drill via from_node_id.
-        - from_node_id: return only the subtree rooted at this node. Use to zoom
-          into one chapter without re-pulling the whole tree."""
+        - max_depth: maximum depth to expand (1 = top-level only, 2 = chapters
+          plus sections, etc.). Auto-tuned by node count when None; auto-clipped
+          further to fit a char budget. Pruned nodes carry has_children=true so
+          you can drill via from_node_id.
+        - from_node_id: return only the subtree rooted at this node. Omit to
+          view the full tree."""
         return tool_get_document_structure(
             documents, doc_id, max_depth=max_depth, from_node_id=from_node_id,
         )
@@ -991,16 +1004,19 @@ def query_agent(
     @function_tool
     def get_node_content(
         doc_id: str,
-        node_id: str,
+        node_id: str | int,
         offset: int = 0,
         length: int | None = None,
     ) -> str:
         """Get the text of a node, windowed by (offset, length).
 
+        node_id is the zero-padded string seen in the tree ("0007", "1119").
+        Bare ints (7, 1119) are also accepted and padded to match.
+
         Default (offset=0, length=None) returns the first ~8000 chars. For long
         nodes the response includes total_chars and has_more — pass
-        offset=<previous end> to continue. Pass an explicit length to request a
-        smaller window."""
+        offset=<previous offset + returned_chars> to continue. Pass an explicit
+        length to request a smaller window."""
         return tool_get_node_content(
             documents, doc_id, node_id, offset=offset, length=length,
         )
