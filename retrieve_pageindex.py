@@ -37,7 +37,15 @@ Env fallbacks:
     PAGEINDEX_STRUCTURE_SUMMARY_MAX_CHARS
                                        Per-node summary preview in structure tool.
                                        Default 160; 0 removes summaries.
-    PAGEINDEX_NODE_TEXT_MAX_CHARS      Cap text returned by get_node_content().
+    PAGEINDEX_STRUCTURE_MAX_CHARS      Char budget for get_document_structure
+                                       payload. Default 120000 (~30K tokens).
+                                       Depth auto-clips until the JSON fits.
+    PAGEINDEX_NODE_TEXT_MAX_CHARS      Default window length for get_node_content
+                                       when length is unspecified (default 8000).
+    PAGEINDEX_NODE_TEXT_WINDOW_MAX_CHARS
+                                       Hard cap on a single get_node_content
+                                       window even when the agent asks for more.
+                                       Default 32000.
 
 Each JSON in --folder must be a tree produced by run_pageindex.py / page_index_main,
 i.e. of shape {"doc_name": ..., "doc_description"?: ..., "structure": [...]}.
@@ -45,11 +53,14 @@ i.e. of shape {"doc_name": ..., "doc_description"?: ..., "structure": [...]}.
 The retriever runs fully locally:
 - No PAGEINDEX_API_KEY (cloud service) required.
 
-The agent is given four tools:
-- list_documents()
+The agent is given four tools (plus an explicit answer() tool):
+- list_documents(mode='brief'|'full')
 - get_document(doc_id)
-- get_document_structure(doc_id)         # text fields stripped
-- get_node_content(doc_id, node_id)      # returns node text, falls back to summary
+- get_document_structure(doc_id, max_depth=None, from_node_id=None)
+      # depth auto-tuned by node count; auto-clipped to fit a char budget.
+      # Older structure outputs are auto-elided from rolling history (F8).
+- get_node_content(doc_id, node_id, offset=0, length=None)
+      # windowed; response includes total_chars + has_more for pagination.
 
 Generate trees with `--if-add-node-text yes --if-add-node-id yes` for best retrieval.
 Without node text, the agent must answer from summaries alone.
@@ -222,9 +233,10 @@ def _truncate_text(value: str | None, max_chars: int) -> str | None:
     return value[:max_chars].rstrip() + "..."
 
 
-def _compact_structure_for_tool(structure, summary_max_chars: int):
-    """Return a navigation-sized tree. Full summaries across large books can
-    exceed local vLLM context before the agent gets to request node text."""
+def _compact_structure_for_tool(structure, summary_max_chars: int, max_depth: int | None = None, _depth: int = 0):
+    """Return a navigation-sized tree. When ``max_depth`` is set, recursion
+    stops at that depth and each pruned node carries ``has_children``/
+    ``num_descendants`` so the agent knows where to drill via from_node_id."""
     compact = []
     for node in structure or []:
         item = {
@@ -237,11 +249,76 @@ def _compact_structure_for_tool(structure, summary_max_chars: int):
         summary = _truncate_text(node.get('summary'), summary_max_chars)
         if summary:
             item['summary'] = summary
-        children = _compact_structure_for_tool(node.get('nodes') or [], summary_max_chars)
+        children = node.get('nodes') or []
         if children:
-            item['nodes'] = children
+            if max_depth is not None and _depth + 1 >= max_depth:
+                item['has_children'] = True
+                item['num_descendants'] = _count_descendants(children)
+            else:
+                item['nodes'] = _compact_structure_for_tool(
+                    children, summary_max_chars, max_depth, _depth + 1
+                )
         compact.append(item)
     return compact
+
+
+def _count_descendants(structure) -> int:
+    total = 0
+    for n in structure or []:
+        total += 1 + _count_descendants(n.get('nodes') or [])
+    return total
+
+
+def _estimate_tokens(text: str) -> int:
+    """Cheap token estimate. We're budgeting, not enforcing a hard limit, so a
+    chars/4 heuristic is sufficient and avoids importing a tokenizer."""
+    return (len(text) + 3) // 4
+
+
+def _build_structure_payload(structure, summary_cap: int, max_depth: int | None, top_n: int | None = None):
+    nodes = structure[:top_n] if top_n is not None else structure
+    return _compact_structure_for_tool(nodes, summary_cap, max_depth)
+
+
+def _fit_structure_to_budget(structure, summary_cap_env: int, requested_depth: int | None, char_budget: int):
+    """Auto-clip depth (and finally summaries / top-level count) until the
+    serialized payload fits ``char_budget``. Returns (compact, depth_used,
+    summary_cap_used, top_n_used)."""
+    if char_budget <= 0:
+        return _build_structure_payload(structure, summary_cap_env, requested_depth), requested_depth, summary_cap_env, None
+
+    # Depth ladder: requested → 3 → 2 → 1. Dedup while preserving order.
+    ladder: list[int | None] = []
+    seen: set[int | None] = set()
+    for d in (requested_depth, 3, 2, 1):
+        if d not in seen:
+            ladder.append(d)
+            seen.add(d)
+
+    last_compact = None
+    for depth in ladder:
+        compact = _build_structure_payload(structure, summary_cap_env, depth)
+        last_compact = compact
+        if len(json.dumps(compact, ensure_ascii=False)) <= char_budget:
+            return compact, depth, summary_cap_env, None
+
+    # Still too big at depth=1: drop summaries.
+    if summary_cap_env > 0:
+        compact = _build_structure_payload(structure, 0, 1)
+        last_compact = compact
+        if len(json.dumps(compact, ensure_ascii=False)) <= char_budget:
+            return compact, 1, 0, None
+
+    # Last resort: slice top-level nodes.
+    top_n = max(1, len(structure))
+    while top_n > 1:
+        top_n = max(1, top_n // 2)
+        compact = _build_structure_payload(structure, 0, 1, top_n=top_n)
+        last_compact = compact
+        if len(json.dumps(compact, ensure_ascii=False)) <= char_budget:
+            return compact, 1, 0, top_n
+
+    return last_compact, 1, 0, 1
 
 
 # ── Document loading ──────────────────────────────────────────────────────────
@@ -299,16 +376,22 @@ def load_documents(folder: Path) -> dict:
 
 # ── Local tool implementations ────────────────────────────────────────────────
 
-def tool_list_documents(documents: dict) -> str:
-    logger.info("tool: list_documents()")
+def tool_list_documents(documents: dict, mode: str = "brief") -> str:
+    """Return all indexed docs. mode='brief' (default) omits doc_description so
+    the listing stays tiny on multi-doc corpora; the rolling agent history
+    re-sends this every turn. mode='full' includes descriptions — use only when
+    the agent needs to triage many docs in one shot."""
+    logger.info("tool: list_documents(mode=%s)", mode)
     out = []
+    include_description = mode == "full"
     for doc_id, doc in documents.items():
         entry = {
             'doc_id': doc_id,
             'doc_name': doc.get('doc_name', ''),
-            'doc_description': doc.get('doc_description', ''),
             'type': doc.get('type', ''),
         }
+        if include_description:
+            entry['doc_description'] = doc.get('doc_description', '')
         if doc.get('type') == 'pdf':
             entry['page_count'] = doc.get('page_count', 0)
         else:
@@ -337,28 +420,119 @@ def tool_get_document(documents: dict, doc_id: str) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-def tool_get_document_structure(documents: dict, doc_id: str) -> str:
-    logger.info("tool: get_document_structure(doc_id=%s)", doc_id)
+def _auto_max_depth_for(total_nodes: int) -> int | None:
+    """Default depth when the caller didn't specify one. Stays unlimited for
+    small docs (where the full tree fits easily) and tightens as size grows."""
+    if total_nodes > 500:
+        return 1
+    if total_nodes > 200:
+        return 2
+    if total_nodes > 80:
+        return 3
+    return None
+
+
+def tool_get_document_structure(
+    documents: dict,
+    doc_id: str,
+    max_depth: int | None = None,
+    from_node_id: str | None = None,
+) -> str:
+    """Return a navigation-sized compact tree.
+
+    Auto-clips depth (and finally summaries / top-level count) so the payload
+    always fits ``PAGEINDEX_STRUCTURE_MAX_CHARS`` (default 120 000 chars,
+    ~30 K tokens). Pass ``from_node_id`` to view just one branch; pass
+    ``max_depth`` to override the auto default. Original tree is never lost —
+    re-call with deeper ``max_depth`` or with ``from_node_id=<pruned-id>`` to
+    keep drilling."""
+    logger.info(
+        "tool: get_document_structure(doc_id=%s, max_depth=%s, from_node_id=%s)",
+        doc_id, max_depth, from_node_id,
+    )
     doc = documents.get(doc_id)
     if not doc:
         logger.warning("  doc_id %s not found", doc_id)
         return json.dumps({'error': f'Document {doc_id} not found'})
+
+    full_structure = doc.get('structure', []) or []
+    if from_node_id:
+        node = _find_node_by_id(full_structure, from_node_id)
+        if not node:
+            return json.dumps({
+                'error': f'Node {from_node_id} not found in {doc_id}',
+            })
+        # Wrap the picked node so the response shape stays identical to the
+        # whole-tree case (a list of top-level entries).
+        view = [node]
+        scope = f'subtree(from_node_id={from_node_id})'
+    else:
+        view = full_structure
+        scope = 'full'
+
+    total_nodes = _count_descendants(view)
     summary_cap = _env_int("PAGEINDEX_STRUCTURE_SUMMARY_MAX_CHARS", 160)
-    structure = _compact_structure_for_tool(doc.get('structure', []), summary_cap)
+    char_budget = _env_int("PAGEINDEX_STRUCTURE_MAX_CHARS", 120000)
+
+    requested_depth = max_depth if max_depth is not None else _auto_max_depth_for(total_nodes)
+    compact, depth_used, summary_cap_used, top_n_used = _fit_structure_to_budget(
+        view, summary_cap, requested_depth, char_budget,
+    )
+
+    hint_parts = []
+    if depth_used is not None:
+        hint_parts.append(
+            f"Tree shown to depth {depth_used}. Nodes with has_children=true are pruned; "
+            f"call get_document_structure(doc_id, from_node_id=<id>) or pass a larger max_depth to expand."
+        )
+    else:
+        hint_parts.append("Full depth shown (small doc).")
+    if requested_depth is not None and depth_used != requested_depth:
+        hint_parts.append(
+            f"depth auto-clipped from requested {requested_depth} to {depth_used} to fit char budget."
+        )
+    if summary_cap_used == 0 and summary_cap > 0:
+        hint_parts.append("summaries dropped to fit budget.")
+    if top_n_used is not None:
+        hint_parts.append(
+            f"top-level nodes truncated to first {top_n_used}; use from_node_id to expand the rest."
+        )
+    hint_parts.append(
+        "Use get_node_content(doc_id, node_id) for text. Avoid re-fetching the full structure once you have node_ids."
+    )
+
     payload = {
         'doc_id': doc_id,
-        'note': (
-            "Compact structure: node text omitted. Use get_node_content(doc_id, node_id) "
-            "for the selected node."
-        ),
-        'summary_max_chars': summary_cap,
-        'structure': structure,
+        'scope': scope,
+        'total_nodes_in_scope': total_nodes,
+        'depth_used': depth_used,
+        'summary_max_chars': summary_cap_used,
+        'char_budget': char_budget,
+        'hint': ' '.join(hint_parts),
+        'structure': compact,
     }
     return json.dumps(payload, ensure_ascii=False)
 
 
-def tool_get_node_content(documents: dict, doc_id: str, node_id: str) -> str:
-    logger.info("tool: get_node_content(doc_id=%s, node_id=%s)", doc_id, node_id)
+def tool_get_node_content(
+    documents: dict,
+    doc_id: str,
+    node_id: str,
+    offset: int = 0,
+    length: int | None = None,
+) -> str:
+    """Return a node's payload, windowed by (offset, length).
+
+    Default behavior matches the legacy prefix-cut: when offset=0 and length is
+    None, returns the first ``PAGEINDEX_NODE_TEXT_MAX_CHARS`` chars (default
+    8000). With explicit offset / length the agent can scroll through long
+    nodes (book chapters can be 200 K+ chars). Always returns
+    ``total_chars``, ``offset``, ``returned_chars`` and ``has_more`` so the
+    agent can plan follow-up windows."""
+    logger.info(
+        "tool: get_node_content(doc_id=%s, node_id=%s, offset=%s, length=%s)",
+        doc_id, node_id, offset, length,
+    )
     doc = documents.get(doc_id)
     if not doc:
         logger.warning("  doc_id %s not found", doc_id)
@@ -367,6 +541,7 @@ def tool_get_node_content(documents: dict, doc_id: str, node_id: str) -> str:
     if not node:
         logger.warning("  node_id %s not found in %s", node_id, doc_id)
         return json.dumps({'error': f'Node {node_id} not found in {doc_id}'})
+
     payload = {
         'doc_id': doc_id,
         'node_id': node_id,
@@ -375,34 +550,127 @@ def tool_get_node_content(documents: dict, doc_id: str, node_id: str) -> str:
         'end_index': node.get('end_index'),
         'line_num': node.get('line_num'),
     }
+
     text = node.get('text')
     summary = node.get('summary')
     if text:
-        payload['text'] = text
+        full = text
         payload['source'] = 'text'
     elif summary:
-        payload['text'] = summary
+        full = summary
         payload['source'] = 'summary'
         payload['note'] = 'Node text was not generated; returning summary instead.'
     else:
-        payload['text'] = ''
+        full = ''
         payload['source'] = 'none'
         payload['note'] = 'Neither text nor summary available for this node.'
 
-    # Cap returned text so the agent's growing message history doesn't push
-    # vLLM/Ollama past the KV cache budget on long sessions or huge nodes.
-    # Override via PAGEINDEX_NODE_TEXT_MAX_CHARS=0 to disable, or any int
-    # to set a custom cap.
-    cap = _env_int("PAGEINDEX_NODE_TEXT_MAX_CHARS", 8000)
-    if cap > 0 and isinstance(payload.get('text'), str) and len(payload['text']) > cap:
-        original = len(payload['text'])
-        payload['text'] = payload['text'][:cap]
-        payload['truncated'] = True
-        payload['original_text_chars'] = original
-        payload['truncated_to_chars'] = cap
-        payload.setdefault('note',
-            f"Text truncated to {cap} chars (original {original}). Adjust PAGEINDEX_NODE_TEXT_MAX_CHARS to change.")
+    total = len(full)
+    default_cap = _env_int("PAGEINDEX_NODE_TEXT_MAX_CHARS", 8000)
+    max_window = _env_int("PAGEINDEX_NODE_TEXT_WINDOW_MAX_CHARS", 32000)
+
+    # Normalize offset / length. offset clamps to [0, total]; length defaults
+    # to the legacy cap when unspecified and is capped at max_window so a
+    # weak model can't ask for 200 K at once.
+    try:
+        offset_int = max(0, int(offset))
+    except (TypeError, ValueError):
+        offset_int = 0
+    offset_int = min(offset_int, total)
+
+    if length is None:
+        window = default_cap if default_cap > 0 else total
+    else:
+        try:
+            window = int(length)
+        except (TypeError, ValueError):
+            window = default_cap
+        if window <= 0:
+            window = total
+    if max_window > 0:
+        window = min(window, max_window)
+
+    end = min(total, offset_int + window) if window > 0 else total
+    sliced = full[offset_int:end] if total else ''
+
+    payload['text'] = sliced
+    payload['total_chars'] = total
+    payload['offset'] = offset_int
+    payload['returned_chars'] = len(sliced)
+    payload['has_more'] = end < total
+    if payload['has_more']:
+        payload.setdefault(
+            'note',
+            f"Windowed view: chars [{offset_int}, {end}) of {total}. "
+            f"Call again with offset={end} to continue."
+        )
     return json.dumps(payload, ensure_ascii=False)
+
+
+# ── History compaction (F8) ───────────────────────────────────────────────────
+
+def _make_structure_history_compactor(target_tool: str = "get_document_structure"):
+    """Build a call_model_input_filter that elides stale tool outputs from the
+    rolling input items. Only the *most recent* ``target_tool`` output is
+    retained verbatim; older ones are replaced with a tiny placeholder so the
+    tree dump doesn't keep occupying tens of thousands of tokens turn after
+    turn. The tool is idempotent, so the agent can always re-call to refetch.
+    """
+    from agents.run_config import ModelInputData
+
+    def _filter(data):
+        items = data.model_data.input
+        if not items:
+            return data.model_data
+
+        # Build call_id → tool name from function_call items.
+        call_id_to_name: dict[str, str] = {}
+        for it in items:
+            if isinstance(it, dict) and it.get("type") == "function_call":
+                cid = it.get("call_id")
+                nm = it.get("name")
+                if cid and nm:
+                    call_id_to_name[cid] = nm
+
+        # Find indices of all function_call_output items belonging to the
+        # target tool. Keep the last; elide the rest.
+        target_indices: list[int] = []
+        for idx, it in enumerate(items):
+            if not (isinstance(it, dict) and it.get("type") == "function_call_output"):
+                continue
+            if call_id_to_name.get(str(it.get("call_id", ""))) == target_tool:
+                target_indices.append(idx)
+
+        if len(target_indices) <= 1:
+            return data.model_data
+
+        to_elide = set(target_indices[:-1])
+        new_items: list = []
+        elided_chars = 0
+        for idx, it in enumerate(items):
+            if idx in to_elide and isinstance(it, dict):
+                original = it.get("output", "")
+                original_str = original if isinstance(original, str) else str(original)
+                placeholder = (
+                    f"[elided earlier {target_tool} output ({len(original_str)} chars); "
+                    f"re-call the tool if you need the tree again]"
+                )
+                if len(placeholder) < len(original_str):
+                    elided_chars += len(original_str) - len(placeholder)
+                    trimmed = dict(it)
+                    trimmed["output"] = placeholder
+                    new_items.append(trimmed)
+                    continue
+            new_items.append(it)
+
+        if elided_chars > 0:
+            logger.info(
+                "history-compactor: elided %d %s output(s), saved ~%d chars",
+                len(to_elide), target_tool, elided_chars,
+            )
+        return ModelInputData(input=new_items, instructions=data.model_data.instructions)
+
+    return _filter
 
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
@@ -410,10 +678,19 @@ def tool_get_node_content(documents: dict, doc_id: str, node_id: str) -> str:
 AGENT_SYSTEM_PROMPT = """
 You are PageIndex, a local document QA assistant.
 TOOL USE:
-- Call list_documents() first to discover available docs.
-- Call get_document(doc_id) to confirm metadata.
-- Call get_document_structure(doc_id) to inspect the compact tree and pick the most relevant node_id(s).
-- Call get_node_content(doc_id, node_id) to read a node's full text. Prefer leaf nodes; expand to parents only if needed.
+- Call list_documents() first (default mode='brief'). Switch to mode='full' only if
+  you need to triage many docs by description in one shot.
+- Call get_document(doc_id) when you need a single doc's description.
+- Call get_document_structure(doc_id) to inspect the compact tree. For large books
+  the call auto-clips depth; pruned nodes carry has_children=true and num_descendants.
+  Drill into a chapter with get_document_structure(doc_id, from_node_id="0007") or
+  pass a larger max_depth on a small doc. Do NOT re-call for the full tree once you
+  already have candidate node_ids — older structure outputs are auto-elided from the
+  rolling history to save context.
+- Call get_node_content(doc_id, node_id) for text. The response carries total_chars
+  and has_more. If has_more=true and you need the rest of a long node, call again
+  with offset=<previous returned_chars + offset>. Prefer leaf nodes; expand to
+  parents only if needed.
 - Before each tool call, output one short sentence explaining the reason.
 Answer based only on tool output. Give a thorough, well-structured answer that explains the key evidence, important caveats, and how the cited evidence supports the conclusion. Cite the doc_id and node_id for each major claim.
 When ready to answer, either write normal assistant text or call answer(answer=...).
@@ -596,7 +873,7 @@ def query_agent(
     api_key: str | None = None,
 ) -> str:
     try:
-        from agents import Agent, Runner, function_tool, set_tracing_disabled
+        from agents import Agent, Runner, RunConfig, function_tool, set_tracing_disabled
         from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
         from openai.types.responses import (
             ResponseTextDeltaEvent,
@@ -616,9 +893,11 @@ def query_agent(
     logger.info("question: %s", question)
 
     @function_tool
-    def list_documents() -> str:
-        """List all indexed documents available locally."""
-        return tool_list_documents(documents)
+    def list_documents(mode: str = "brief") -> str:
+        """List indexed documents. mode='brief' (default) returns id/name/type/size;
+        mode='full' also returns doc_description. Prefer 'brief' when only navigating —
+        fetch a single description via get_document(doc_id) when needed."""
+        return tool_list_documents(documents, mode=mode)
 
     @function_tool
     def get_document(doc_id: str) -> str:
@@ -626,14 +905,39 @@ def query_agent(
         return tool_get_document(documents, doc_id)
 
     @function_tool
-    def get_document_structure(doc_id: str) -> str:
-        """Get the full tree structure (without raw text) to find relevant nodes."""
-        return tool_get_document_structure(documents, doc_id)
+    def get_document_structure(
+        doc_id: str,
+        max_depth: int | None = None,
+        from_node_id: str | None = None,
+    ) -> str:
+        """Get a navigation-sized compact tree.
+
+        Optional args:
+        - max_depth: maximum depth to expand (e.g. 1 = top-level only). Auto-tuned
+          by node count when None. Auto-clipped further to fit a token budget;
+          pruned nodes carry has_children=true so you can drill via from_node_id.
+        - from_node_id: return only the subtree rooted at this node. Use to zoom
+          into one chapter without re-pulling the whole tree."""
+        return tool_get_document_structure(
+            documents, doc_id, max_depth=max_depth, from_node_id=from_node_id,
+        )
 
     @function_tool
-    def get_node_content(doc_id: str, node_id: str) -> str:
-        """Get the full text of a specific node by its node_id."""
-        return tool_get_node_content(documents, doc_id, node_id)
+    def get_node_content(
+        doc_id: str,
+        node_id: str,
+        offset: int = 0,
+        length: int | None = None,
+    ) -> str:
+        """Get the text of a node, windowed by (offset, length).
+
+        Default (offset=0, length=None) returns the first ~8000 chars. For long
+        nodes the response includes total_chars and has_more — pass
+        offset=<previous end> to continue. Pass an explicit length to request a
+        smaller window."""
+        return tool_get_node_content(
+            documents, doc_id, node_id, offset=offset, length=length,
+        )
 
     @function_tool
     def answer(answer: str) -> str:
@@ -689,7 +993,16 @@ def query_agent(
         # history, which is what eventually saturates vLLM's KV cache on
         # local hosts.
         _max_turns = int(os.getenv("PAGEINDEX_AGENT_MAX_TURNS", "30"))
-        streamed_run = Runner.run_streamed(agent, question, max_turns=_max_turns)
+        # F8: elide stale get_document_structure outputs from the rolling
+        # history so a 30 K-token tree dump doesn't keep occupying ctx after
+        # the agent has already extracted its node_ids.
+        run_config = RunConfig(
+            call_model_input_filter=_make_structure_history_compactor(),
+            tracing_disabled=True,
+        )
+        streamed_run = Runner.run_streamed(
+            agent, question, max_turns=_max_turns, run_config=run_config,
+        )
         current_kind = None
         tool_outputs_for_refine = []
         async for event in streamed_run.stream_events():
