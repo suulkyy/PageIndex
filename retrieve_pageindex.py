@@ -497,8 +497,15 @@ def tool_get_document_structure(
     if from_node_id:
         node = _find_node_by_id(full_structure, from_node_id)
         if not node:
+            suggestions = _suggest_node_ids(full_structure, from_node_id)
             return json.dumps({
-                'error': f'Node {from_node_id} not found in {doc_id}',
+                'error': f'Node {from_node_id!r} not found in {doc_id}',
+                'hint': (
+                    "node_id must be the zero-padded string used in the tree "
+                    "(e.g. '0007', '1119'). Try one of the nearest existing ids, "
+                    "or omit from_node_id to view the full tree."
+                ),
+                'suggested_node_ids': suggestions,
             })
         # Wrap the picked node so the response shape stays identical to the
         # whole-tree case (a list of top-level entries).
@@ -578,11 +585,19 @@ def tool_get_node_content(
     node = _find_node_by_id(doc.get('structure', []), node_id)
     if not node:
         logger.warning("  node_id %s not found in %s", node_id, doc_id)
-        return json.dumps({'error': f'Node {node_id} not found in {doc_id}'})
+        return json.dumps({
+            'error': f'Node {node_id!r} not found in {doc_id}',
+            'hint': (
+                "node_id must be the zero-padded string used in the tree "
+                "(e.g. '0007', '1119')."
+            ),
+            'suggested_node_ids': _suggest_node_ids(doc.get('structure', []), node_id),
+        })
 
+    resolved_node_id = node.get('node_id', str(node_id))
     payload = {
         'doc_id': doc_id,
-        'node_id': node_id,
+        'node_id': resolved_node_id,
         'title': node.get('title', ''),
         'start_index': node.get('start_index'),
         'end_index': node.get('end_index'),
