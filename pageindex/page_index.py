@@ -1175,74 +1175,201 @@ def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_in
 
 
 
-def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_check_page_num=None, model=None, logger=None):
-    toc_with_page_number = toc_transformer(toc_content, model, logger=logger)
-    logger.info(f'toc_with_page_number: {toc_with_page_number}')
+def _quick_offset_heuristic_score(toc_items, offset, page_list, sample_size=10):
+    """Apply `offset` to `toc_items` and check (purely deterministically)
+    whether each item's title appears at the top of its predicted page.
 
-    offset = guess_page_offset_from_toc(toc_with_page_number, toc_page_list)
-    logger.info(f'offset guess from toc: {offset}')
-    if offset is None:
-        toc_no_page_number = remove_page_number(copy.deepcopy(toc_with_page_number))
+    Returns (score, scored_count) where score = yes_count / scored_count,
+    or (0.0, 0) when nothing could be scored. Uses
+    `check_title_appearance_in_start_heuristic` (normalized prefix match
+    within the first 1500 chars of the predicted page). Pure-Python — no
+    LLM calls — fast enough to evaluate both candidate offsets before
+    committing.
 
-        start_page_index = toc_page_list[-1] + 1
-        # Per-page snippets so we can pack into context-bounded chunks.
-        # Single-shot main_content of `toc_check_page_num` dense pages can
-        # exceed `max-model-len` on small-context vLLM servers (e.g. PRML
-        # at 65k context: 20 pages × ~3000 tok = 60k+, prompt overflows).
-        page_snippets = []
-        page_token_lens = []
-        for page_index in range(start_page_index, min(start_page_index + toc_check_page_num, len(page_list))):
-            snippet = f"<physical_index_{page_index+1}>\n{page_list[page_index][0]}\n<physical_index_{page_index+1}>\n\n"
-            page_snippets.append(snippet)
-            page_token_lens.append(count_tokens(snippet, model=model) or 0)
+    Sample is spread evenly across the TOC, not the first N items, since
+    front-matter items (Preface, Acknowledgements) have weak
+    title-appearance signal and would bias a head-only sample."""
+    if offset is None or not toc_items or not page_list:
+        return 0.0, 0
+    candidates = [
+        it for it in toc_items
+        if isinstance(it, dict)
+        and isinstance(it.get('page'), int)
+        and it.get('page') > 0
+    ]
+    if not candidates:
+        return 0.0, 0
+    n = len(candidates)
+    if n <= sample_size:
+        sampled = candidates
+    else:
+        step = n / sample_size
+        sampled = [candidates[int(i * step)] for i in range(sample_size)]
 
-        budget = _default_group_max_tokens(model)
-        toc_json_tokens = count_tokens(str(toc_no_page_number), model=model) or 0
-        # Reserve room for the toc JSON (replayed in every prompt) and a
-        # ~800-token prompt template overhead. Floor at 2000 so very long
-        # TOCs still split into one-page-at-a-time chunks instead of
-        # collapsing to zero.
-        content_budget = max(2000, budget - toc_json_tokens - 800)
+    yes = 0
+    scored = 0
+    for item in sampled:
+        page = item.get('page')
+        title = item.get('title') or ''
+        phys = page + offset
+        if phys < 1 or phys > len(page_list):
+            continue
+        page_text = page_list[phys - 1][0] if page_list[phys - 1] else ''
+        verdict = check_title_appearance_in_start_heuristic(title, page_text)
+        if verdict == 'yes':
+            yes += 1
+            scored += 1
+        elif verdict == 'no':
+            scored += 1
+        # None → ambiguous, don't count toward scored
+    if scored == 0:
+        return 0.0, 0
+    return yes / scored, scored
+
+
+def _compute_llm_pair_offset(toc_with_page_number, toc_page_list, page_list,
+                             toc_check_page_num=None, model=None, logger=None):
+    """LLM-paired offset: extract physical_index for items in the first N
+    content pages via `toc_index_extractor` (chunked to fit `max-model-len`),
+    match titles against `toc_with_page_number`, and `calculate_page_offset`
+    from the resulting pairs. Returns None on failure.
+
+    Extracted into a helper so `process_toc_with_page_numbers` can call it
+    either as the primary path (when `guess_page_offset_from_toc` returns
+    None) or as a cross-validation candidate against the cheap deterministic
+    guess (Phase 1.3 of the book-scale fix plan)."""
+    toc_no_page_number = remove_page_number(copy.deepcopy(toc_with_page_number))
+
+    start_page_index = toc_page_list[-1] + 1
+    page_snippets = []
+    page_token_lens = []
+    for page_index in range(start_page_index, min(start_page_index + (toc_check_page_num or 0), len(page_list))):
+        snippet = f"<physical_index_{page_index+1}>\n{page_list[page_index][0]}\n<physical_index_{page_index+1}>\n\n"
+        page_snippets.append(snippet)
+        page_token_lens.append(count_tokens(snippet, model=model) or 0)
+
+    budget = _default_group_max_tokens(model)
+    toc_json_tokens = count_tokens(str(toc_no_page_number), model=model) or 0
+    # Reserve room for the toc JSON (replayed in every prompt) and a
+    # ~800-token prompt template overhead. Floor at 2000 so very long
+    # TOCs still split into one-page-at-a-time chunks.
+    content_budget = max(2000, budget - toc_json_tokens - 800)
+    if logger:
         logger.info(
             f'toc_index chunking: budget={budget} toc_json_tokens={toc_json_tokens} '
             f'content_budget={content_budget} pages={len(page_snippets)}'
         )
 
-        chunks = []
-        current = []
-        current_tokens = 0
-        for snippet, snippet_tokens in zip(page_snippets, page_token_lens):
-            if current and current_tokens + snippet_tokens > content_budget:
-                chunks.append(''.join(current))
-                current = [snippet]
-                current_tokens = snippet_tokens
-            else:
-                current.append(snippet)
-                current_tokens += snippet_tokens
-        if current:
+    chunks = []
+    current = []
+    current_tokens = 0
+    for snippet, snippet_tokens in zip(page_snippets, page_token_lens):
+        if current and current_tokens + snippet_tokens > content_budget:
             chunks.append(''.join(current))
+            current = [snippet]
+            current_tokens = snippet_tokens
+        else:
+            current.append(snippet)
+            current_tokens += snippet_tokens
+    if current:
+        chunks.append(''.join(current))
+    if logger:
         logger.info(f'toc_index_extractor running over {len(chunks)} chunk(s)')
 
-        toc_with_physical_index = []
-        for i, chunk in enumerate(chunks):
-            chunk_result = toc_index_extractor(toc_no_page_number, chunk, model)
-            if isinstance(chunk_result, dict):
-                # Defensive: extract_json may wrap list under a key
-                if isinstance(chunk_result.get('table_of_contents'), list):
-                    chunk_result = chunk_result['table_of_contents']
-                else:
-                    chunk_result = []
-            if not isinstance(chunk_result, list):
+    toc_with_physical_index = []
+    for i, chunk in enumerate(chunks):
+        chunk_result = toc_index_extractor(toc_no_page_number, chunk, model)
+        if isinstance(chunk_result, dict):
+            # Defensive: extract_json may wrap list under a key
+            if isinstance(chunk_result.get('table_of_contents'), list):
+                chunk_result = chunk_result['table_of_contents']
+            else:
                 chunk_result = []
-            chunk_result = convert_physical_index_to_int(chunk_result)
-            toc_with_physical_index = _merge_toc_items(toc_with_physical_index, chunk_result)
-            logger.info(f'toc_index_extractor chunk {i+1}/{len(chunks)} added {len(chunk_result)} items; total={len(toc_with_physical_index)}')
+        if not isinstance(chunk_result, list):
+            chunk_result = []
+        chunk_result = convert_physical_index_to_int(chunk_result)
+        toc_with_physical_index = _merge_toc_items(toc_with_physical_index, chunk_result)
+        if logger:
+            logger.info(
+                f'toc_index_extractor chunk {i+1}/{len(chunks)} added '
+                f'{len(chunk_result)} items; total={len(toc_with_physical_index)}'
+            )
 
-        matching_pairs = extract_matching_page_pairs(toc_with_page_number, toc_with_physical_index, start_page_index)
+    matching_pairs = extract_matching_page_pairs(
+        toc_with_page_number, toc_with_physical_index, start_page_index,
+    )
+    if logger:
         logger.info(f'matching_pairs: {matching_pairs}')
 
-        offset = calculate_page_offset(matching_pairs)
-        logger.info(f'offset: {offset}')
+    offset = calculate_page_offset(matching_pairs)
+    if logger:
+        logger.info(f'llm_pair_offset: {offset}')
+    return offset
+
+
+def process_toc_with_page_numbers(toc_content, toc_page_list, page_list,
+                                  toc_check_page_num=None, model=None,
+                                  logger=None, force_llm_pair_offset=False):
+    """Drive the with-page-numbers TOC alignment path.
+
+    Phase 1.3 cross-validation: when `guess_page_offset_from_toc` returns
+    a deterministic cheap guess, run a heuristic 10-item check. If the
+    cheap offset scores ≥ 0.7, commit to it; otherwise compute the
+    LLM-pair offset and pick whichever scores higher. When
+    `force_llm_pair_offset=True`, skip the cheap path entirely (used by
+    meta_processor's cascade re-offset on verify accuracy < 0.2)."""
+    toc_with_page_number = toc_transformer(toc_content, model, logger=logger)
+    logger.info(f'toc_with_page_number: {toc_with_page_number}')
+
+    cheap_offset = None
+    if not force_llm_pair_offset:
+        cheap_offset = guess_page_offset_from_toc(toc_with_page_number, toc_page_list)
+        logger.info(f'offset guess from toc: {cheap_offset}')
+    else:
+        logger.info('force_llm_pair_offset=True; skipping cheap deterministic guess')
+
+    offset = None
+    if cheap_offset is not None:
+        cheap_score, cheap_scored = _quick_offset_heuristic_score(
+            toc_with_page_number, cheap_offset, page_list,
+        )
+        logger.info(
+            f'cheap_offset={cheap_offset} heuristic score={cheap_score:.2f} '
+            f'({cheap_scored} items scored)'
+        )
+        if cheap_score >= 0.7 and cheap_scored >= 3:
+            offset = cheap_offset
+        else:
+            # Cheap guess is dubious — compute LLM-pair offset and pick
+            # whichever heuristic-scores higher on the same sample.
+            llm_offset = _compute_llm_pair_offset(
+                toc_with_page_number, toc_page_list, page_list,
+                toc_check_page_num=toc_check_page_num, model=model, logger=logger,
+            )
+            if llm_offset is not None:
+                llm_score, llm_scored = _quick_offset_heuristic_score(
+                    toc_with_page_number, llm_offset, page_list,
+                )
+                logger.info(
+                    f'llm_pair_offset={llm_offset} heuristic score={llm_score:.2f} '
+                    f'({llm_scored} items scored)'
+                )
+                # Strict > to prefer cheap on ties (deterministic, no LLM cost).
+                offset = llm_offset if llm_score > cheap_score else cheap_offset
+                logger.info(
+                    f'offset cross-validated: cheap={cheap_offset} '
+                    f'llm={llm_offset} → chosen={offset}'
+                )
+            else:
+                offset = cheap_offset
+                logger.info(f'llm_pair_offset unavailable; falling back to cheap={offset}')
+    if offset is None:
+        # Either force_llm_pair_offset=True or guess_page_offset_from_toc
+        # returned None (rare). Run LLM-pair as the primary path.
+        offset = _compute_llm_pair_offset(
+            toc_with_page_number, toc_page_list, page_list,
+            toc_check_page_num=toc_check_page_num, model=model, logger=logger,
+        )
     if offset is None:
         raise Exception('Failed to infer page offset from table of contents')
 
@@ -1562,26 +1689,34 @@ async def verify_toc(page_list, list_result, start_index=1, N=None, model=None):
 
 
 ################### main process #########################################################
-async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=None, start_index=1, opt=None, logger=None):
+async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=None,
+                         start_index=1, opt=None, logger=None,
+                         force_llm_pair_offset=False):
     print(mode)
     print(f'start_index: {start_index}')
-    
+
     if mode == 'process_toc_with_page_numbers':
-        toc_with_page_number = process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_check_page_num=opt.toc_check_page_num, model=opt.model, logger=logger)
+        toc_with_page_number = process_toc_with_page_numbers(
+            toc_content, toc_page_list, page_list,
+            toc_check_page_num=opt.toc_check_page_num,
+            model=opt.model,
+            logger=logger,
+            force_llm_pair_offset=force_llm_pair_offset,
+        )
     elif mode == 'process_toc_no_page_numbers':
         toc_with_page_number = process_toc_no_page_numbers(toc_content, toc_page_list, page_list, model=opt.model, logger=logger)
     else:
         toc_with_page_number = process_no_toc(page_list, start_index=start_index, model=opt.model, logger=logger)
-            
-    toc_with_page_number = [item for item in toc_with_page_number if item.get('physical_index') is not None] 
-    
+
+    toc_with_page_number = [item for item in toc_with_page_number if item.get('physical_index') is not None]
+
     toc_with_page_number = validate_and_truncate_physical_indices(
-        toc_with_page_number, 
-        len(page_list), 
-        start_index=start_index, 
+        toc_with_page_number,
+        len(page_list),
+        start_index=start_index,
         logger=logger
     )
-    
+
     verify_sample_num = getattr(opt, 'toc_verify_sample_num', None)
     if verify_sample_num is not None and verify_sample_num <= 0:
         verify_sample_num = None
@@ -1592,11 +1727,12 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
         N=verify_sample_num,
         model=opt.model,
     )
-        
+
     logger.info({
-        'mode': 'process_toc_with_page_numbers',
+        'mode': mode,
         'accuracy': accuracy,
-        'incorrect_results': incorrect_results
+        'incorrect_results': incorrect_results,
+        'force_llm_pair_offset': force_llm_pair_offset,
     })
     if accuracy == 1.0 and len(incorrect_results) == 0:
         return toc_with_page_number
@@ -1604,6 +1740,31 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
         toc_with_page_number, incorrect_results = await fix_incorrect_toc_with_retries(toc_with_page_number, page_list, incorrect_results,start_index=start_index, max_attempts=3, model=opt.model, logger=logger)
         return toc_with_page_number
     else:
+        # Phase 1.4 cascade: when verify accuracy collapses (< 0.2) for
+        # `process_toc_with_page_numbers` and we have NOT yet forced the
+        # LLM-pair offset path, retry the same mode with
+        # force_llm_pair_offset=True before falling through to the lossier
+        # no_page_numbers fallback. This catches wrong-anchor offsets that
+        # the heuristic cross-validation in process_toc_with_page_numbers
+        # accepted but actual LLM verification rejects.
+        if (mode == 'process_toc_with_page_numbers'
+                and accuracy < 0.2
+                and not force_llm_pair_offset):
+            logger.info(
+                f'cascade re-offset: accuracy={accuracy:.3f} < 0.2; '
+                'retrying process_toc_with_page_numbers with '
+                'force_llm_pair_offset=True before falling through'
+            )
+            return await meta_processor(
+                page_list,
+                mode='process_toc_with_page_numbers',
+                toc_content=toc_content,
+                toc_page_list=toc_page_list,
+                start_index=start_index,
+                opt=opt,
+                logger=logger,
+                force_llm_pair_offset=True,
+            )
         if mode == 'process_toc_with_page_numbers':
             return await meta_processor(page_list, mode='process_toc_no_page_numbers', toc_content=toc_content, toc_page_list=toc_page_list, start_index=start_index, opt=opt, logger=logger)
         elif mode == 'process_toc_no_page_numbers':
