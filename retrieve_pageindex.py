@@ -494,7 +494,11 @@ def tool_get_document_structure(
         return json.dumps({'error': f'Document {doc_id} not found'})
 
     full_structure = doc.get('structure', []) or []
-    if from_node_id:
+    # Treat empty/zero ints as "no scope" so from_node_id=0 means "root tree"
+    # rather than "find node_id 0" (which surprises the agent because root is
+    # node_id "0000", not "0").
+    has_scope = from_node_id not in (None, "", 0, "0")
+    if has_scope:
         node = _find_node_by_id(full_structure, from_node_id)
         if not node:
             suggestions = _suggest_node_ids(full_structure, from_node_id)
@@ -507,10 +511,8 @@ def tool_get_document_structure(
                 ),
                 'suggested_node_ids': suggestions,
             })
-        # Wrap the picked node so the response shape stays identical to the
-        # whole-tree case (a list of top-level entries).
         view = [node]
-        scope = f'subtree(from_node_id={from_node_id})'
+        scope = f'subtree(from_node_id={node.get("node_id")!r})'
     else:
         view = full_structure
         scope = 'full'
@@ -518,6 +520,17 @@ def tool_get_document_structure(
     total_nodes = _count_descendants(view)
     summary_cap = _env_int("PAGEINDEX_STRUCTURE_SUMMARY_MAX_CHARS", 160)
     char_budget = _env_int("PAGEINDEX_STRUCTURE_MAX_CHARS", 120000)
+
+    # Clamp pathological max_depth values. max_depth=0 would prune everything
+    # at the root and return an essentially empty payload — agents occasionally
+    # ask for it thinking it means "minimum"; treat as 1 (top-level only).
+    if max_depth is not None:
+        try:
+            max_depth = int(max_depth)
+        except (TypeError, ValueError):
+            max_depth = None
+        if max_depth is not None and max_depth < 1:
+            max_depth = 1
 
     requested_depth = max_depth if max_depth is not None else _auto_max_depth_for(total_nodes)
     compact, depth_used, summary_cap_used, top_n_used = _fit_structure_to_budget(
