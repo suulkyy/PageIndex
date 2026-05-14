@@ -697,17 +697,16 @@ def page_list_to_group_text(page_contents, token_lengths, max_tokens=None, overl
     print('divide page_list to groups', len(subsets))
     return subsets
 
-def add_page_number_to_toc(part, structure, model=None):
-    fill_prompt_seq = """
+_ADD_PAGE_NUMBER_PROMPT = """
     You are given an JSON structure of a document and a partial part of the document. Your task is to check if the title that is described in the structure is started in the partial given document.
 
-    The provided text contains tags like <physical_index_X> and <physical_index_X> to indicate the physical location of the page X. 
+    The provided text contains tags like <physical_index_X> and <physical_index_X> to indicate the physical location of the page X.
 
     If the full target section starts in the partial given document, insert the given JSON structure with the "start": "yes", and "start_index": "<physical_index_X>".
 
     If the full target section does not start in the partial given document, insert "start": "no",  "start_index": None.
 
-    The response should be in the following format. 
+    The response should be in the following format.
         [
             {
                 "structure": <structure index, "x.x.x" or None> (string),
@@ -716,18 +715,155 @@ def add_page_number_to_toc(part, structure, model=None):
                 "physical_index": "<physical_index_X> (keep the format)" or None
             },
             ...
-        ]    
-    The given structure contains the result of the previous part, you need to fill the result of the current part, do not change the previous result.
+        ]
     Directly return the final JSON structure. Do not output anything else."""
 
-    prompt = fill_prompt_seq + f"\n\nCurrent Partial Document:\n{part}\n\nGiven Structure\n{json.dumps(structure, indent=2)}\n"
-    current_json_raw = llm_completion(model=model, prompt=prompt)
-    json_result = extract_json(current_json_raw)
-    
-    for item in json_result:
-        if 'start' in item:
+
+def _add_page_number_chunk(part, sub_structure, model=None, logger=None):
+    """Single LLM call asking which items in `sub_structure` start
+    within `part`. Salvages truncated replies via `_finish_toc_json`
+    (recovers the items that did parse and re-prompts for the rest).
+    Returns a list of {structure, title, physical_index, ...} dicts."""
+    # Strip transient fields before sending so the model sees a clean
+    # input that matches the prompt schema (the prompt frames
+    # physical_index as a field the model INSERTS, not echoes).
+    cleaned = []
+    for item in sub_structure:
+        if not isinstance(item, dict):
+            continue
+        cleaned.append({
+            k: v for k, v in item.items()
+            if k not in ('physical_index', 'start', 'start_index')
+        })
+
+    prompt = (
+        _ADD_PAGE_NUMBER_PROMPT
+        + f"\n\nCurrent Partial Document:\n{part}\n\nGiven Structure\n"
+        + json.dumps(cleaned, indent=2)
+        + "\n"
+    )
+    response, finish_reason = llm_completion(
+        model=model, prompt=prompt, return_finish_reason=True,
+    )
+    items = _finish_toc_json(prompt, response, finish_reason, model=model, logger=logger)
+    if isinstance(items, dict) and isinstance(items.get('table_of_contents'), list):
+        items = items['table_of_contents']
+    if not isinstance(items, list):
+        items = []
+    for item in items:
+        if isinstance(item, dict) and 'start' in item:
             del item['start']
-    return json_result
+    return items
+
+
+def add_page_number_to_toc(part, structure, model=None, chunk_size=None, logger=None):
+    """Fill `physical_index` for items in `structure` whose section
+    starts within `part`.
+
+    Three Phase-2 scaling behaviors layered on top of the upstream
+    single-shot prompt:
+
+      * **Tail-only replay** — items that already carry a
+        non-None `physical_index` from an earlier page-group pass are
+        kept in the returned structure but NOT re-sent to the LLM.
+        Cuts prompt size 90 %+ on the back half of a long doc.
+      * **Chunked structure** — unfilled items are split into
+        `chunk_size`-item windows (env: `PAGEINDEX_FILL_CHUNK_SIZE`,
+        default 50). Each window goes in its own LLM call, so the
+        per-call prompt is bounded irrespective of TOC size. On book2
+        (1099 TOC items) this turns one ~50 k-token prompt into
+        ~22 ~5 k-token prompts that fit comfortably in any context.
+      * **Truncation salvage** — each chunk call routes through
+        `_finish_toc_json`, recovering complete items from a
+        `finish_reason=length` reply and re-prompting for the rest
+        instead of discarding the whole call.
+
+    Mutates `structure` in place when given a list (preserves items
+    the LLM omits — strict improvement over the upstream behavior of
+    replacing the structure with the LLM's reply). For backward
+    compatibility with `process_none_page_numbers`'s single-item
+    call site, also accepts a dict and returns the chunk reply
+    directly (caller indexes [0])."""
+    # Single-dict call path (process_none_page_numbers): wrap, fire one
+    # chunk call, return the raw list reply.
+    if isinstance(structure, dict):
+        return _add_page_number_chunk(part, [structure], model=model, logger=logger)
+    if not isinstance(structure, list):
+        return structure
+
+    unfilled_indices = [
+        i for i, it in enumerate(structure)
+        if isinstance(it, dict) and it.get('physical_index') is None
+    ]
+    if not unfilled_indices:
+        return structure
+
+    if chunk_size is None:
+        chunk_size = get_llm_runtime_int(
+            "pageindex_fill_chunk_size",
+            ("PAGEINDEX_FILL_CHUNK_SIZE",),
+            50,
+        )
+    chunk_size = max(1, chunk_size)
+
+    chunks = [
+        unfilled_indices[start:start + chunk_size]
+        for start in range(0, len(unfilled_indices), chunk_size)
+    ]
+    if logger:
+        logger.info(
+            f'add_page_number_to_toc: {len(unfilled_indices)} unfilled items '
+            f'split into {len(chunks)} chunk(s) of <= {chunk_size}'
+        )
+
+    for chunk_idx, chunk_idx_list in enumerate(chunks):
+        sub_structure = [structure[i] for i in chunk_idx_list]
+        try:
+            sub_result = _add_page_number_chunk(
+                part, sub_structure, model=model, logger=logger,
+            )
+        except Exception as e:
+            # Per-chunk resilience: a single failing chunk should not torch
+            # the whole page-group iteration. Log and continue; downstream
+            # iterations get another chance to fill these items.
+            if logger:
+                logger.info(
+                    f'add_page_number_to_toc chunk {chunk_idx+1}/{len(chunks)} '
+                    f'failed; keeping prior state. err={e}'
+                )
+            continue
+
+        # Match results back to the original items by (structure, title).
+        # The LLM is told to echo these verbatim, so exact-string keys are
+        # the safe primary; (None, title) is a defensive fallback for
+        # items without a structure index.
+        result_by_key = {}
+        for r in sub_result:
+            if not isinstance(r, dict):
+                continue
+            key = (
+                str(r.get('structure', '')) if r.get('structure') is not None else None,
+                str(r.get('title', '')) if r.get('title') is not None else None,
+            )
+            result_by_key[key] = r
+
+        for i in chunk_idx_list:
+            orig = structure[i]
+            if not isinstance(orig, dict):
+                continue
+            key = (
+                str(orig.get('structure', '')) if orig.get('structure') is not None else None,
+                str(orig.get('title', '')) if orig.get('title') is not None else None,
+            )
+            r = result_by_key.get(key)
+            if r is None:
+                continue
+            phys = r.get('physical_index')
+            if phys is None:
+                continue
+            orig['physical_index'] = phys
+
+    return structure
 
 
 def remove_first_physical_index_section(text):
@@ -1165,7 +1301,9 @@ def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_in
 
     toc_with_page_number=copy.deepcopy(toc_content)
     for group_text in group_texts:
-        toc_with_page_number = add_page_number_to_toc(group_text, toc_with_page_number, model)
+        toc_with_page_number = add_page_number_to_toc(
+            group_text, toc_with_page_number, model, logger=logger,
+        )
     logger.info(f'add_page_number_to_toc: {toc_with_page_number}')
 
     toc_with_page_number = convert_physical_index_to_int(toc_with_page_number)
