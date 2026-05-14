@@ -423,7 +423,11 @@ def parse_toc_content_heuristic(toc_content):
         front_matter_index = parsed["front_matter_index"]
         items.append(parsed["item"])
 
+    # Confidence is parsing yield, computed BEFORE dedup so the gating
+    # threshold in `toc_transformer` reflects raw parser quality, not
+    # how many duplicates a particular layout happened to produce.
     confidence = len(items) / candidate_count if candidate_count else 0
+    items = _dedupe_heuristic_items(items)
     stats = {
         "items": len(items),
         "candidates": candidate_count,
@@ -810,6 +814,77 @@ def _normalize_title_for_match(title):
     return re.sub(r'\s+', ' ', _strip_continuation_suffix(title)).strip().lower()
 
 
+def _dedupe_heuristic_items(items, logger=None):
+    """Collapse entries with identical (structure, title) into a single
+    item, preferring the LAST occurrence in document order.
+
+    Why: textbooks frequently ship two contents sections — a "Brief
+    Contents" (chapters only) followed by a detailed "Contents"
+    (chapters + subsections). `parse_toc_content_heuristic` captures
+    both, duplicating every chapter entry. Keeping the LAST occurrence
+    selects the detailed Contents pass, preserving chapter→subsection
+    adjacency in the list so `post_processing` can build correct
+    parent/child relationships and `guess_page_offset_from_toc` anchors
+    on the detailed-contents pagination (not the brief-contents page
+    numbers that broke the book2.pdf 1370-page run: 3.74% verify
+    accuracy from the wrong anchor).
+
+    Items missing both structure and title are passed through unchanged
+    (preserves narrative front-matter)."""
+    if not isinstance(items, list):
+        return items
+    last_index = {}
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        struct = item.get('structure')
+        title = item.get('title')
+        if not struct and not title:
+            continue
+        key = (
+            str(struct) if struct else None,
+            str(title).strip().lower() if title else None,
+        )
+        last_index[key] = i
+
+    dropped = 0
+    cleaned = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            cleaned.append(item)
+            continue
+        struct = item.get('structure')
+        title = item.get('title')
+        if not struct and not title:
+            cleaned.append(item)
+            continue
+        key = (
+            str(struct) if struct else None,
+            str(title).strip().lower() if title else None,
+        )
+        if last_index.get(key) == i:
+            cleaned.append(item)
+        else:
+            dropped += 1
+
+    if dropped and logger:
+        logger.info(
+            f'_dedupe_heuristic_items dropped {dropped} duplicate entries '
+            '(typically Brief Contents vs detailed Contents)'
+        )
+    return cleaned
+
+
+def _normalize_toc_items(items, logger=None):
+    """Canonical post-mutation cleanup for TOC item lists. Composes
+    `_dedupe_heuristic_items` (Brief-vs-detailed Contents collisions)
+    with `_collapse_continuation_items` (LLM continuation echoes).
+    Idempotent — safe to call at every TOC mutation point."""
+    items = _dedupe_heuristic_items(items, logger=logger)
+    items = _collapse_continuation_items(items, logger=logger)
+    return items
+
+
 def _collapse_continuation_items(items, logger=None):
     """Drop continuation echoes the model emits when a section spans several
     chunks. Two adjacent items collapse when they share the same `structure`
@@ -1064,11 +1139,11 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None):
             )
     logger.info(f'generate_toc: {toc_with_page_number}')
 
-    # Collapse '(Continued)' echoes the model invents to dodge the dedup key —
-    # different `structure` keys ("F.1", "F.2") on identical physical_index get
-    # folded back into one section here.
-    toc_with_page_number = _collapse_continuation_items(toc_with_page_number, logger=logger)
-    logger.info(f'after _collapse_continuation_items: {toc_with_page_number}')
+    # Canonical normalize: dedup Brief-vs-detailed Contents collisions +
+    # collapse '(Continued)' echoes (different `structure` keys "F.1",
+    # "F.2" on identical physical_index get folded back into one section).
+    toc_with_page_number = _normalize_toc_items(toc_with_page_number, logger=logger)
+    logger.info(f'after _normalize_toc_items: {toc_with_page_number}')
 
     toc_with_page_number = convert_physical_index_to_int(toc_with_page_number)
     logger.info(f'convert_physical_index_to_int: {toc_with_page_number}')
@@ -1553,10 +1628,10 @@ async def process_large_node_recursively(node, page_list, opt=None, logger=None)
         print('large node:', node['title'], 'start_index:', node['start_index'], 'end_index:', node['end_index'], 'token_num:', token_num)
 
         node_toc_tree = await meta_processor(node_page_list, mode='process_no_toc', start_index=node['start_index'], opt=opt, logger=logger)
-        # Belt-and-braces: collapse any '(Continued)'/duplicate-structure
-        # echoes the model produced inside this recursion before they become
-        # tree siblings.
-        node_toc_tree = _collapse_continuation_items(node_toc_tree, logger=logger)
+        # Belt-and-braces: canonical normalize before these items become
+        # tree siblings — dedup duplicate (structure, title) + collapse
+        # '(Continued)' echoes the model produced inside this recursion.
+        node_toc_tree = _normalize_toc_items(node_toc_tree, logger=logger)
         node_toc_tree = await check_title_appearance_in_start_concurrent(node_toc_tree, page_list, model=opt.model, logger=logger)
 
         # Filter out items with None physical_index before post_processing
