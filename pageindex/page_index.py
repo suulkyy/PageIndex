@@ -5,6 +5,10 @@ import math
 import random
 import re
 from .utils import *
+# Star import skips underscore-prefixed names; pull in the semaphore
+# explicitly so Phase 3 chunk parallelism can share the project-wide
+# in-flight LLM-call cap.
+from .utils import _get_llm_sem
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -697,6 +701,82 @@ def page_list_to_group_text(page_contents, token_lengths, max_tokens=None, overl
     print('divide page_list to groups', len(subsets))
     return subsets
 
+def _extract_page_range_from_group(group_text):
+    """Parse `<physical_index_X>` tags from a page-group text and return
+    (min_phys, max_phys). Returns (None, None) when no tags are found.
+    Used by `process_toc_no_page_numbers` to tell
+    `add_page_number_to_toc` which page range a given group covers so it
+    can prune candidates that cannot possibly start there."""
+    if not group_text:
+        return None, None
+    indices = re.findall(r'<physical_index_(\d+)>', group_text)
+    if not indices:
+        return None, None
+    ints = [int(s) for s in indices]
+    return min(ints), max(ints)
+
+
+def _coerce_physical_index_to_int(phys):
+    """Best-effort int conversion for a `physical_index` value.
+
+    Accepts either a plain int or the `<physical_index_N>` string format
+    items wear while still in flight (before
+    `convert_physical_index_to_int` runs). Returns None when neither."""
+    if isinstance(phys, int):
+        return phys
+    if isinstance(phys, str):
+        m = re.search(r'physical_index_(\d+)', phys)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _filter_by_feasible_range(structure, unfilled_indices, g_min, g_max):
+    """Phase 3.1 chapter-local pruning.
+
+    For each unfilled item, the nearest filled neighbours in TOC order
+    bound its physical_index: prev_phys ≤ feasible ≤ next_phys. Drop
+    items whose feasible window doesn't overlap the current group's
+    page range [g_min, g_max]. As the document fills out, each
+    chapter's subsections converge onto the page-group that actually
+    covers them — total LLM-call cost falls from O(TOC × groups) to
+    roughly O(TOC). Strictly preserves correctness: a dropped item
+    cannot start in this group's pages, so it has nothing to contribute
+    here and will be reconsidered against later groups."""
+    if g_min is None or g_max is None:
+        return list(unfilled_indices)
+
+    out = []
+    unfilled_set = set(unfilled_indices)
+    n = len(structure)
+    for i in unfilled_indices:
+        prev_phys = 1
+        for j in range(i - 1, -1, -1):
+            if j in unfilled_set:
+                continue
+            it = structure[j]
+            if not isinstance(it, dict):
+                continue
+            cand = _coerce_physical_index_to_int(it.get('physical_index'))
+            if cand is not None:
+                prev_phys = cand
+                break
+        next_phys = float('inf')
+        for j in range(i + 1, n):
+            if j in unfilled_set:
+                continue
+            it = structure[j]
+            if not isinstance(it, dict):
+                continue
+            cand = _coerce_physical_index_to_int(it.get('physical_index'))
+            if cand is not None:
+                next_phys = cand
+                break
+        if g_max >= prev_phys and g_min <= next_phys:
+            out.append(i)
+    return out
+
+
 _ADD_PAGE_NUMBER_PROMPT = """
     You are given an JSON structure of a document and a partial part of the document. Your task is to check if the title that is described in the structure is started in the partial given document.
 
@@ -719,14 +799,16 @@ _ADD_PAGE_NUMBER_PROMPT = """
     Directly return the final JSON structure. Do not output anything else."""
 
 
-def _add_page_number_chunk(part, sub_structure, model=None, logger=None):
+async def _add_page_number_chunk(part, sub_structure, model=None, logger=None):
     """Single LLM call asking which items in `sub_structure` start
     within `part`. Salvages truncated replies via `_finish_toc_json`
     (recovers the items that did parse and re-prompts for the rest).
-    Returns a list of {structure, title, physical_index, ...} dicts."""
-    # Strip transient fields before sending so the model sees a clean
-    # input that matches the prompt schema (the prompt frames
-    # physical_index as a field the model INSERTS, not echoes).
+    Returns a list of {structure, title, physical_index, ...} dicts.
+
+    Async via `asyncio.to_thread` around the sync llm_completion +
+    _finish_toc_json body — keeps the salvage logic in one place while
+    letting the outer add_page_number_to_toc run many chunk calls
+    concurrently under `_get_llm_sem`."""
     cleaned = []
     for item in sub_structure:
         if not isinstance(item, dict):
@@ -742,52 +824,61 @@ def _add_page_number_chunk(part, sub_structure, model=None, logger=None):
         + json.dumps(cleaned, indent=2)
         + "\n"
     )
-    response, finish_reason = llm_completion(
-        model=model, prompt=prompt, return_finish_reason=True,
-    )
-    items = _finish_toc_json(prompt, response, finish_reason, model=model, logger=logger)
-    if isinstance(items, dict) and isinstance(items.get('table_of_contents'), list):
-        items = items['table_of_contents']
-    if not isinstance(items, list):
-        items = []
-    for item in items:
-        if isinstance(item, dict) and 'start' in item:
-            del item['start']
-    return items
+
+    def _sync_body():
+        response, finish_reason = llm_completion(
+            model=model, prompt=prompt, return_finish_reason=True,
+        )
+        items = _finish_toc_json(prompt, response, finish_reason, model=model, logger=logger)
+        if isinstance(items, dict) and isinstance(items.get('table_of_contents'), list):
+            items = items['table_of_contents']
+        if not isinstance(items, list):
+            items = []
+        for item in items:
+            if isinstance(item, dict) and 'start' in item:
+                del item['start']
+        return items
+
+    return await asyncio.to_thread(_sync_body)
 
 
-def add_page_number_to_toc(part, structure, model=None, chunk_size=None, logger=None):
+async def add_page_number_to_toc(part, structure, model=None, chunk_size=None, logger=None, group_page_range=None):
     """Fill `physical_index` for items in `structure` whose section
     starts within `part`.
 
-    Three Phase-2 scaling behaviors layered on top of the upstream
-    single-shot prompt:
+    Five layered scaling behaviors on top of the upstream single-shot
+    prompt. Same correctness, bounded prompt size, parallelism within
+    a page-group:
 
-      * **Tail-only replay** — items that already carry a
+      * **Tail-only replay** (Phase 2.2) — items already carrying a
         non-None `physical_index` from an earlier page-group pass are
         kept in the returned structure but NOT re-sent to the LLM.
-        Cuts prompt size 90 %+ on the back half of a long doc.
-      * **Chunked structure** — unfilled items are split into
-        `chunk_size`-item windows (env: `PAGEINDEX_FILL_CHUNK_SIZE`,
-        default 50). Each window goes in its own LLM call, so the
-        per-call prompt is bounded irrespective of TOC size. On book2
-        (1099 TOC items) this turns one ~50 k-token prompt into
-        ~22 ~5 k-token prompts that fit comfortably in any context.
-      * **Truncation salvage** — each chunk call routes through
-        `_finish_toc_json`, recovering complete items from a
-        `finish_reason=length` reply and re-prompting for the rest
-        instead of discarding the whole call.
+      * **Chunked structure** (Phase 2.1) — unfilled items are split
+        into `chunk_size`-item windows
+        (env `PAGEINDEX_FILL_CHUNK_SIZE`, default 50). Each window
+        fires its own LLM call so the per-call prompt is bounded
+        irrespective of TOC size.
+      * **Truncation salvage** (Phase 2.3) — each chunk call routes
+        through `_finish_toc_json` to recover from
+        `finish_reason=length`.
+      * **Chapter-local pruning** (Phase 3.1) — when the caller
+        supplies `group_page_range=(g_min, g_max)`, drop unfilled
+        items whose feasible window (bounded by the nearest filled
+        TOC neighbours) doesn't overlap. As items fill in across the
+        page-group loop, later groups receive a smaller candidate
+        list — total LLM-call cost falls from O(TOC × groups) toward
+        O(TOC).
+      * **Within-group parallelism** (Phase 3.2) — chunk calls fan
+        out via `asyncio.gather` under `_get_llm_sem`. Disjoint item
+        subsets → no fill conflicts. Wall-clock falls near-linearly
+        with `PAGEINDEX_LLM_CONCURRENCY`.
 
     Mutates `structure` in place when given a list (preserves items
-    the LLM omits — strict improvement over the upstream behavior of
-    replacing the structure with the LLM's reply). For backward
-    compatibility with `process_none_page_numbers`'s single-item
-    call site, also accepts a dict and returns the chunk reply
-    directly (caller indexes [0])."""
-    # Single-dict call path (process_none_page_numbers): wrap, fire one
-    # chunk call, return the raw list reply.
+    the LLM omits). For backward compatibility with
+    `process_none_page_numbers`'s single-item call site, also accepts
+    a dict and returns the chunk reply directly (caller indexes [0])."""
     if isinstance(structure, dict):
-        return _add_page_number_chunk(part, [structure], model=model, logger=logger)
+        return await _add_page_number_chunk(part, [structure], model=model, logger=logger)
     if not isinstance(structure, list):
         return structure
 
@@ -797,6 +888,21 @@ def add_page_number_to_toc(part, structure, model=None, chunk_size=None, logger=
     ]
     if not unfilled_indices:
         return structure
+
+    if group_page_range and group_page_range[0] is not None:
+        before = len(unfilled_indices)
+        unfilled_indices = _filter_by_feasible_range(
+            structure, unfilled_indices,
+            group_page_range[0], group_page_range[1],
+        )
+        if logger and before != len(unfilled_indices):
+            logger.info(
+                f'add_page_number_to_toc: chapter-local pruning '
+                f'{before} → {len(unfilled_indices)} candidates '
+                f'for group_range=[{group_page_range[0]}, {group_page_range[1]}]'
+            )
+        if not unfilled_indices:
+            return structure
 
     if chunk_size is None:
         chunk_size = get_llm_runtime_int(
@@ -816,27 +922,29 @@ def add_page_number_to_toc(part, structure, model=None, chunk_size=None, logger=
             f'split into {len(chunks)} chunk(s) of <= {chunk_size}'
         )
 
-    for chunk_idx, chunk_idx_list in enumerate(chunks):
-        sub_structure = [structure[i] for i in chunk_idx_list]
-        try:
-            sub_result = _add_page_number_chunk(
-                part, sub_structure, model=model, logger=logger,
-            )
-        except Exception as e:
-            # Per-chunk resilience: a single failing chunk should not torch
-            # the whole page-group iteration. Log and continue; downstream
-            # iterations get another chance to fill these items.
-            if logger:
-                logger.info(
-                    f'add_page_number_to_toc chunk {chunk_idx+1}/{len(chunks)} '
-                    f'failed; keeping prior state. err={e}'
-                )
-            continue
+    sem = _get_llm_sem()
 
-        # Match results back to the original items by (structure, title).
-        # The LLM is told to echo these verbatim, so exact-string keys are
-        # the safe primary; (None, title) is a defensive fallback for
-        # items without a structure index.
+    async def _run_chunk(chunk_idx, chunk_idx_list):
+        sub_structure = [structure[i] for i in chunk_idx_list]
+        async with sem:
+            try:
+                sub_result = await _add_page_number_chunk(
+                    part, sub_structure, model=model, logger=logger,
+                )
+                return chunk_idx_list, sub_result
+            except Exception as e:
+                if logger:
+                    logger.info(
+                        f'add_page_number_to_toc chunk {chunk_idx+1}/{len(chunks)} '
+                        f'failed; keeping prior state. err={e}'
+                    )
+                return chunk_idx_list, []
+
+    results = await asyncio.gather(*(
+        _run_chunk(i, chunk) for i, chunk in enumerate(chunks)
+    ))
+
+    for chunk_idx_list, sub_result in results:
         result_by_key = {}
         for r in sub_result:
             if not isinstance(r, dict):
@@ -1286,7 +1394,7 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None):
 
     return toc_with_page_number
 
-def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_index=1, model=None, logger=None):
+async def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_index=1, model=None, logger=None):
     page_contents=[]
     token_lengths=[]
     toc_content = toc_transformer(toc_content, model, logger=logger)
@@ -1300,9 +1408,15 @@ def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_in
     logger.info(f'len(group_texts): {len(group_texts)}')
 
     toc_with_page_number=copy.deepcopy(toc_content)
+    # Outer loop stays sequential so tail-only replay + chapter-local
+    # pruning compound: each group reads the latest fills and narrows
+    # candidates further. Within-group chunk parallelism is what
+    # actually speeds this up (see add_page_number_to_toc).
     for group_text in group_texts:
-        toc_with_page_number = add_page_number_to_toc(
+        group_min, group_max = _extract_page_range_from_group(group_text)
+        toc_with_page_number = await add_page_number_to_toc(
             group_text, toc_with_page_number, model, logger=logger,
+            group_page_range=(group_min, group_max),
         )
     logger.info(f'add_page_number_to_toc: {toc_with_page_number}')
 
@@ -1445,9 +1559,9 @@ def _compute_llm_pair_offset(toc_with_page_number, toc_page_list, page_list,
     return offset
 
 
-def process_toc_with_page_numbers(toc_content, toc_page_list, page_list,
-                                  toc_check_page_num=None, model=None,
-                                  logger=None, force_llm_pair_offset=False):
+async def process_toc_with_page_numbers(toc_content, toc_page_list, page_list,
+                                        toc_check_page_num=None, model=None,
+                                        logger=None, force_llm_pair_offset=False):
     """Drive the with-page-numbers TOC alignment path.
 
     Phase 1.3 cross-validation: when `guess_page_offset_from_toc` returns
@@ -1514,7 +1628,7 @@ def process_toc_with_page_numbers(toc_content, toc_page_list, page_list,
     toc_with_page_number = add_page_offset_to_toc_json(toc_with_page_number, offset)
     logger.info(f'toc_with_page_number: {toc_with_page_number}')
 
-    toc_with_page_number = process_none_page_numbers(toc_with_page_number, page_list, model=model)
+    toc_with_page_number = await process_none_page_numbers(toc_with_page_number, page_list, model=model)
     logger.info(f'toc_with_page_number: {toc_with_page_number}')
 
     return toc_with_page_number
@@ -1522,7 +1636,7 @@ def process_toc_with_page_numbers(toc_content, toc_page_list, page_list,
 
 
 ##check if needed to process none page numbers
-def process_none_page_numbers(toc_items, page_list, start_index=1, model=None):
+async def process_none_page_numbers(toc_items, page_list, start_index=1, model=None):
     for i, item in enumerate(toc_items):
         if "physical_index" not in item:
             if item.get("page") is None:
@@ -1555,7 +1669,7 @@ def process_none_page_numbers(toc_items, page_list, start_index=1, model=None):
 
             item_copy = copy.deepcopy(item)
             del item_copy['page']
-            result = add_page_number_to_toc(page_contents, item_copy, model)
+            result = await add_page_number_to_toc(page_contents, item_copy, model)
             if isinstance(result[0]['physical_index'], str) and result[0]['physical_index'].startswith('<physical_index'):
                 item['physical_index'] = int(result[0]['physical_index'].split('_')[-1].rstrip('>').strip())
                 del item['page']
@@ -1834,7 +1948,7 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
     print(f'start_index: {start_index}')
 
     if mode == 'process_toc_with_page_numbers':
-        toc_with_page_number = process_toc_with_page_numbers(
+        toc_with_page_number = await process_toc_with_page_numbers(
             toc_content, toc_page_list, page_list,
             toc_check_page_num=opt.toc_check_page_num,
             model=opt.model,
@@ -1842,7 +1956,7 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
             force_llm_pair_offset=force_llm_pair_offset,
         )
     elif mode == 'process_toc_no_page_numbers':
-        toc_with_page_number = process_toc_no_page_numbers(toc_content, toc_page_list, page_list, model=opt.model, logger=logger)
+        toc_with_page_number = await process_toc_no_page_numbers(toc_content, toc_page_list, page_list, model=opt.model, logger=logger)
     else:
         toc_with_page_number = process_no_toc(page_list, start_index=start_index, model=opt.model, logger=logger)
 
