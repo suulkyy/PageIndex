@@ -1883,6 +1883,24 @@ async def fix_incorrect_toc_with_retries(toc_with_page_number, page_list, incorr
 
 ################### verify toc #########################################################
 async def verify_toc(page_list, list_result, start_index=1, N=None, model=None):
+    """Verify TOC alignment by asking an LLM whether each sampled item's
+    title actually starts on its predicted physical page.
+
+    Sampling strategy (Phase 4):
+
+      * **Stratified** — instead of `random.sample` (head-skewed in
+        expectation and blind to localized offset failures), samples
+        are placed at the midpoint of equal-width windows across the
+        TOC. One sample per `total / effective_n` items catches
+        late-chapter pagination shifts a head-random sample misses.
+      * **Auto-cap** — when N is None ("check all", the upstream
+        config default of `toc_verify_sample_num: 0`) AND the TOC is
+        book-scale (`> PAGEINDEX_VERIFY_AUTO_CAP_THRESHOLD`, default
+        200), N is bounded to `PAGEINDEX_VERIFY_AUTO_CAP_SAMPLE`
+        (default 40). On book2.pdf (1099 TOC items) this cuts the
+        9-minute wasted check-all verify into ~30 s. Explicit N from
+        the user is honoured verbatim — only the implicit
+        "check all" path is auto-bounded."""
     print('start verify_toc')
     # Find the last non-None physical_index
     last_physical_index = None
@@ -1890,19 +1908,50 @@ async def verify_toc(page_list, list_result, start_index=1, N=None, model=None):
         if item.get('physical_index') is not None:
             last_physical_index = item['physical_index']
             break
-    
+
     # Early return if we don't have valid physical indices
     if last_physical_index is None or last_physical_index < len(page_list)/2:
         return 0, []
-    
-    # Determine which items to check
-    if N is None:
+
+    total = len(list_result)
+    auto_cap_threshold = get_llm_runtime_int(
+        "pageindex_verify_auto_cap_threshold",
+        ("PAGEINDEX_VERIFY_AUTO_CAP_THRESHOLD",),
+        200,
+    )
+    auto_cap_sample = get_llm_runtime_int(
+        "pageindex_verify_auto_cap_sample",
+        ("PAGEINDEX_VERIFY_AUTO_CAP_SAMPLE",),
+        40,
+    )
+
+    if N is None and total > auto_cap_threshold:
+        effective_n = min(auto_cap_sample, total)
+        print(
+            f'auto-cap: total={total} > {auto_cap_threshold}; '
+            f'verifying {effective_n} stratified items '
+            '(set toc_verify_sample_num explicitly to override)'
+        )
+    elif N is None:
+        effective_n = total
         print('check all items')
-        sample_indices = range(0, len(list_result))
     else:
-        N = min(N, len(list_result))
-        print(f'check {N} items')
-        sample_indices = random.sample(range(0, len(list_result)), N)
+        effective_n = min(N, total)
+        print(f'check {effective_n} items')
+
+    # Stratified sampling: midpoint of each equal-width window across
+    # the TOC. Deterministic — re-runs see the same sample so the
+    # accuracy threshold is reproducible.
+    if effective_n >= total:
+        sample_indices = list(range(total))
+    elif effective_n <= 0:
+        sample_indices = []
+    else:
+        step = total / effective_n
+        sample_indices = sorted(set(
+            min(total - 1, int(i * step + step / 2))
+            for i in range(effective_n)
+        ))
 
     # Prepare items with their list indices
     indexed_sample_list = []
