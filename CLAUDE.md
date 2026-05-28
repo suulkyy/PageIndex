@@ -8,8 +8,8 @@ PageIndex builds a hierarchical "table-of-contents" tree from long PDFs (or Mark
 
 ## Repo layout (tracked files only)
 
-- Top level: `run_pageindex.py`, `run_pageindex_verbose.py`, `retrieve_pageindex.py`, `pyproject.toml`, `requirements.txt`, `LICENSE`, `README.md`, `AGENTS.md`, `CLAUDE.md`.
-- `pageindex/` package: `page_index.py` (PDF pipeline), `page_index_md.py` (Markdown pipeline), `utils.py` (LLM layer, config loader, helpers), `retrieve.py` + `client.py` (programmatic retrieval), `config.yaml` (defaults), `__init__.py`.
+- Top level: `run_pageindex.py`, `run_pageindex_verbose.py`, `retrieve_pageindex.py`, `build_index.py`, `pyproject.toml`, `requirements.txt`, `LICENSE`, `README.md`, `AGENTS.md`, `CLAUDE.md`.
+- `pageindex/` package: `page_index.py` (PDF pipeline), `page_index_md.py` (Markdown pipeline), `utils.py` (LLM layer, config loader, helpers), `retrieve.py` + `client.py` (programmatic retrieval), `index_store.py` (persistent SQLite/BM25 index for fast & cross-doc retrieval), `config.yaml` (defaults), `__init__.py`.
 - `cookbook/` notebooks: `pageindex_RAG_simple.ipynb`, `vision_RAG_pageindex.ipynb`, `agentic_retrieval.ipynb`, `pageIndex_chat_quickstart.ipynb`, `README.md`.
 - `examples/` — `agentic_vectorless_rag_demo.py`, `documents/` (sample PDFs + pre-built `_structure.json` outputs under `documents/results/`), `tutorials/doc-search/`, `tutorials/tree-search/`, `workspace/` (sample workspace dump used by `PageIndexClient`).
 - `.github/` — workflows for CodeQL, dependency review, and issue dedupe (`autoclose-labeled-issues`, `backfill-dedupe`, `issue-dedupe`, `remove-autoclose-label`); `.claude/commands/dedupe.md` is the dedupe agent prompt.
@@ -184,6 +184,37 @@ python3 retrieve_pageindex.py --folder ./results --question "..."
 # prefix model with ollama/, vllm/, openai/, litellm/ for auto-detect
 python3 retrieve_pageindex.py --folder ./results --question "..." --provider ollama --model llama3.1:8b
 ```
+
+#### Retrieval modes (`--mode`, default `hybrid`)
+
+`retrieve_pageindex.py` backs all modes with a persistent SQLite index (`pageindex/index_store.py`) built over the folder. The index is refreshed **incrementally at startup** (unchanged trees skipped via mtime+size), so no separate build step is required; `build_index.py` exists for offline/batch building and inspection. The DB lives at `<folder>/.pageindex_index.db` (gitignored). FTS5 ships with the stdlib `sqlite3` here, so BM25 needs no extra dependency and no GPU server.
+
+- **`fast`** — one-shot. Global BM25 candidate select across **all** docs → fetch top-K node text by key → a single synthesis LLM call. No agent loop, no per-doc tree walk; cross-document by construction; fastest. Skips loading every tree into RAM (avoids the per-query loading wall at scale).
+- **`agent`** — the iterative agent tree-walk, now also given a `search_all_documents` tool so it can pull cross-document candidates in one round-trip.
+- **`hybrid`** (default) — BM25 candidates seed the agent's input; the agent can then drill/verify with the per-doc tools for multi-hop reasoning. Best of both.
+
+```bash
+# Build/refresh the index offline (optional — modes auto-refresh)
+python3 build_index.py --folder ./results            # incremental
+python3 build_index.py --folder ./results --reindex  # force full rebuild
+
+# Fastest cross-doc answer (single LLM call)
+python3 retrieve_pageindex.py --folder ./results --mode fast \
+  --provider vllm --model rag-llm --question "..."
+```
+
+Mode-specific env knobs (fast/hybrid):
+- `PAGEINDEX_FAST_POOL` — BM25 candidate pool size before top-K slice (default `50`).
+- `PAGEINDEX_FAST_TOP_K` — nodes whose text is fed to the synthesis call (default `8`).
+- `PAGEINDEX_FAST_MAX_PER_DOC` — cap nodes per document in the top-K (default `0` = unlimited). A single BM25 ranking over a multi-topic question can be monopolized by one topic's doc; set e.g. `2`–`3` to surface cross-document evidence.
+- `PAGEINDEX_FAST_NODE_MAX_CHARS` — per-node evidence cap (default `8000`).
+- `PAGEINDEX_FAST_EVIDENCE_MAX_CHARS` — total evidence-block cap fed to the synthesis call (default `60000`).
+- `PAGEINDEX_FAST_MAX_TOKENS` — synthesis output cap (default `2048`).
+- `PAGEINDEX_HYBRID_SEED_K` — cross-doc candidates injected into the agent's input in hybrid mode (default `12`).
+- `--db PATH` overrides the index location for any mode.
+
+Known limitation: BM25 is lexical, so a multi-topic query can rank one topic's document above the others. `PAGEINDEX_FAST_MAX_PER_DOC` diversifies the fast path; hybrid/agent modes' `search_all_documents` (called with a refined sub-query) is the intended fix for true multi-hop. Semantic embeddings + reranker are a planned Phase-2 add-on (would reuse the LightRAG `:8001`/`:8002` servers).
+
 Logs: `./logs/retrieve_<YYYYMMDD_HHMMSS>.log` (`--log-file` to override). Both `sys.stdout` and `sys.stderr` are tee'd into this file, so the agent's streamed reasoning, tool-call/tool-output prints, final answer, and any tracebacks all land in the log. Bare lines get a `[YYYY-MM-DD HH:MM:SS.mmm]` prefix in the file copy; logger lines (already formatted with asctime) pass through unchanged. `--verbose` prints tool args + output previews.
 
 #### Running retrieval with custom Ollama / vLLM models
@@ -302,14 +333,20 @@ All LLM calls go through `llm_completion` / `llm_acompletion` — both wrap Lite
 `retrieve.py` exposes 3 stateless tools over a `documents` dict: `get_document`, `get_document_structure` (text fields stripped), `get_page_content` (PDF: page nums; MD: line nums via `_get_md_page_content`). `client.py:PageIndexClient` is the user-facing wrapper — `index()` writes trees + cached page text into a workspace dir keyed by uuid; tools resolve through it. A sample workspace lives at `examples/workspace/` (`_meta.json` + uuid-keyed JSON) for hands-on exploration. `_normalize_retrieve_model` keeps `litellm/` and `openai/` as passthrough but rewrites bare `provider/model` to `litellm/provider/model` so the OpenAI Agents SDK routes via LiteLLM.
 
 ### Standalone retriever (`retrieve_pageindex.py`)
-Loads `*.json` from a folder, infers PDF vs MD per-file by node fields (`start_index` → pdf, `line_num` → md). The agent gets **5 tools**:
+Loads `*.json` from a folder, infers PDF vs MD per-file by node fields (`start_index` → pdf, `line_num` → md). Has three `--mode`s (default `hybrid`) all backed by a persistent SQLite index (see `### Index store` below): `fast` (one-shot BM25 → single synthesis call, no agent loop — `run_fast` + `_synthesize_answer` + `_assemble_evidence`), `agent` (the loop), and `hybrid` (BM25 candidates seed the agent input). `fast` mode never calls `load_documents`, so it sidesteps parsing every tree into RAM.
+
+The agent gets **6 tools**:
 - `list_documents()`
 - `get_document(doc_id)` — metadata only.
 - `get_document_structure(doc_id)` — returns a navigation-sized compact tree (`_compact_structure_for_tool`): `title`, `node_id`, span fields, truncated `summary` (≤ `PAGEINDEX_STRUCTURE_SUMMARY_MAX_CHARS=160` chars), nested `nodes`. Full text is never inlined here.
 - `get_node_content(doc_id, node_id)` — node payload; text capped at `PAGEINDEX_NODE_TEXT_MAX_CHARS=8000` chars by default with truncation metadata when applied.
+- `search_all_documents(query, top_k=10)` — global BM25 across **all** indexed docs, returning cross-doc candidates (`doc_id`, `node_id`, `title`, `breadcrumb`, truncated `summary`, score). Only registered when the SQLite index is available (`store is not None`); the system prompt tells the agent it may be absent and to fall back to per-doc navigation. This is the in-loop fix for the single-doc-sourcing bias.
 - `answer(answer)` — explicit final-answer tool. The agent is configured with `tool_use_behavior={"stop_at_tool_names": ["answer"]}` so calling it terminates the run and emits the argument as the final response. Added because some weak local models hallucinated a fake `answer` tool call mid-stream and crashed the runner.
 
 The agent is constructed with `parallel_tool_calls=False` (serial tool calling) — keeps tool order deterministic and avoids weak models interleaving partial calls. `resolve_provider` strips known prefixes; `_build_agent_model` constructs an `AsyncOpenAI` client + `OpenAIChatCompletionsModel` for vllm/ollama (Chat Completions, not Responses API). Streams reasoning + tool calls live; falls back to `asyncio.run` in a worker thread when called from inside an existing loop.
+
+### Index store (`pageindex/index_store.py`, `build_index.py`)
+`IndexStore` builds one SQLite DB over a folder of trees: `documents` (per-doc meta), `nodes` (flattened tree with breadcrumb/parent_id/depth + node text-by-key), `nodes_fts` (standalone FTS5 mirror for BM25 across all docs, carrying `doc_id`/`node_rowid` as UNINDEXED columns so a doc's rows can be deleted on refresh), `file_manifest` (path→mtime/size/doc_id for incremental rebuilds), `index_meta`. `build(folder, reindex=False)` skips files whose mtime+size are unchanged and drops docs whose source file vanished. `search(question, top_k)` runs a recall-oriented OR'd FTS5 MATCH ranked by `bm25()` (lower = better). `get_node_content` resolves bare/unpadded node ids (weak-model tolerance, mirrors `_find_node_by_id`) and falls back to the node `summary` when the tree was built without text. `retrieve_pageindex.py:_open_index_for_folder` opens + incrementally refreshes it at startup; `build_index.py` is the offline CLI. Phase-1 scope is BM25-only — no embeddings/vectors yet (a vector DB is unnecessary at this corpus size; the bottleneck is LLM round-trips, not search).
 
 ### Logging (`pageindex/utils.py:JsonLogger`)
 Per-document JSON-line logger writing to `./logs/<sanitized_doc_name>.log` (`logs/` is gitignored). `run_pageindex_verbose.py` monkey-patches it to also emit single-line stderr previews, then tees both `sys.stdout` and `sys.stderr` into a separate timestamped tee log (`./logs/run_<YYYYMMDD_HHMMSS>.log`) so all upstream prints + tracebacks are captured. The tee adds `[YYYY-MM-DD HH:MM:SS.mmm]` per bare line in the file copy; lines that already begin with a timestamp pattern pass through unchanged. `retrieve_pageindex.py` does the same stdout+stderr tee into `./logs/retrieve_<YYYYMMDD_HHMMSS>.log`, with a single `StreamHandler` pointed at the (already-tee'd) `sys.stderr` — there's no separate `FileHandler`, so logger lines reach the file via the tee and never double-write.

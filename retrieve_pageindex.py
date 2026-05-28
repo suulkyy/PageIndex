@@ -53,7 +53,18 @@ i.e. of shape {"doc_name": ..., "doc_description"?: ..., "structure": [...]}.
 The retriever runs fully locally:
 - No PAGEINDEX_API_KEY (cloud service) required.
 
-The agent is given four tools (plus an explicit answer() tool):
+Retrieval modes (--mode, default 'hybrid'):
+- fast   : one-shot. Global BM25 candidate select over a persistent SQLite index
+           -> fetch top-K node text by key -> single synthesis LLM call. No agent
+           loop, no per-doc tree walk; cross-document by construction; fastest.
+- agent  : the iterative agent tree-walk, now also given a search_all_documents
+           tool so it can pull cross-document candidates in one round-trip.
+- hybrid : BM25 candidates seed the agent's context, which can then drill/verify
+           with the per-doc tools for multi-hop reasoning. Best of both.
+fast/hybrid build+refresh the SQLite index at startup (incremental; see
+build_index.py to build it offline). The index lives at <folder>/.pageindex_index.db.
+
+The agent is given five tools (plus an explicit answer() tool):
 - list_documents(mode='brief'|'full')
 - get_document(doc_id)
 - get_document_structure(doc_id, max_depth=None, from_node_id=None)
@@ -61,6 +72,9 @@ The agent is given four tools (plus an explicit answer() tool):
       # Older structure outputs are auto-elided from rolling history (F8).
 - get_node_content(doc_id, node_id, offset=0, length=None)
       # windowed; response includes total_chars + has_more for pagination.
+- search_all_documents(query, top_k=10)
+      # global BM25 across ALL indexed docs; returns cross-doc candidates.
+      # Only present when the SQLite index is available.
 
 Generate trees with `--if-add-node-text yes --if-add-node-id yes` for best retrieval.
 Without node text, the agent must answer from summaries alone.
@@ -750,8 +764,15 @@ ID FORMAT (important — weak models get this wrong):
   as a JSON string with quotes, NOT as a bare integer.
 
 TOOL USE:
-- Call list_documents() first (default mode='brief'). Switch to mode='full' only if
-  doc names alone aren't enough to disambiguate.
+- The answer may require evidence from MORE THAN ONE document. Identify all relevant
+  documents, not just the first plausible one.
+- Call search_all_documents(query) FIRST when the question may span documents, or when
+  you don't yet know which document holds the answer. It BM25-searches every indexed
+  document at once and returns ranked candidates (doc_id, node_id, title, breadcrumb,
+  summary) across the whole corpus. Then fetch the promising ones with get_node_content.
+  (This tool may be absent if the index is unavailable — fall back to per-doc navigation.)
+- Call list_documents() (default mode='brief') to enumerate docs. Switch to mode='full'
+  only if doc names alone aren't enough to disambiguate.
 - Call get_document(doc_id) when you need one doc's full description.
 - Call get_document_structure(doc_id) to inspect the compact tree. For large books
   the call auto-clips depth; pruned nodes carry has_children=true and num_descendants.
@@ -766,7 +787,7 @@ TOOL USE:
 - Before each tool call, output one short sentence explaining the reason.
 - If a tool returns an error with suggested_node_ids, switch to one of those — do
   NOT retry the same argument value.
-Answer based only on tool output. Give a thorough, well-structured answer that explains the key evidence, important caveats, and how the cited evidence supports the conclusion. Cite the doc_id and node_id for each major claim.
+Answer based only on tool output. Give a thorough, well-structured answer that explains the key evidence, important caveats, and how the cited evidence supports the conclusion. Cite the doc_id and node_id for each major claim; when the evidence spans multiple documents, draw on all of the relevant ones.
 When ready to answer, either write normal assistant text or call answer(answer=...).
 Do not call answer before using the document tools needed for evidence.
 """
@@ -851,6 +872,189 @@ def _build_agent_model(provider: str, model: str, base_url: str | None, api_key:
     resolved_key = api_key or os.getenv(f"{provider.upper()}_API_KEY") or "EMPTY"
     client = AsyncOpenAI(base_url=resolved_base, api_key=resolved_key)
     return OpenAIChatCompletionsModel(model=model, openai_client=client)
+
+
+# ── Fast / hybrid retrieval (SQLite + BM25, single synthesis call) ─────────────
+
+def _open_index_for_folder(folder: Path, db_path: str | None = None):
+    """Open and incrementally refresh the SQLite index for a folder. Returns an
+    open IndexStore, or None if the index couldn't be built/loaded (callers then
+    fall back to the agent loop)."""
+    try:
+        from pageindex.index_store import DEFAULT_DB_NAME, IndexStore
+    except ImportError:
+        logger.warning("index_store unavailable; cross-doc fast path disabled")
+        return None
+    db = Path(db_path).expanduser().resolve() if db_path else folder / DEFAULT_DB_NAME
+    try:
+        store = IndexStore(db)
+        summary = store.build(folder)  # incremental — skips unchanged trees
+        logger.info("index refresh (%s): %s", db, summary)
+        if store.is_empty():
+            logger.warning("index is empty after build; fast path disabled")
+            store.close()
+            return None
+        return store
+    except Exception:
+        logger.exception("failed to open/refresh index; fast path disabled")
+        return None
+
+
+async def _synthesize_answer(
+    provider: str,
+    model: str,
+    base_url: str | None,
+    api_key: str | None,
+    system: str,
+    user: str,
+    max_tokens: int,
+) -> str:
+    """One non-agentic LLM call. Mirrors the provider resolution used for the
+    agent model so fast mode works on the same vllm/ollama/openai/litellm
+    targets without a tool loop."""
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    if provider == "litellm":
+        import litellm
+        kwargs = {"max_tokens": max_tokens} if max_tokens > 0 else {}
+        resp = await litellm.acompletion(model=model, messages=messages, temperature=0, **kwargs)
+        msg = resp.choices[0].message
+        return (getattr(msg, "content", None) or "").strip()
+
+    from openai import AsyncOpenAI
+    if provider in ("vllm", "ollama"):
+        resolved_base = base_url or DEFAULT_BASE_URLS[provider]
+        key = api_key or os.getenv(f"{provider.upper()}_API_KEY") or "EMPTY"
+    else:  # openai (hosted or custom base url)
+        resolved_base = base_url
+        key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("CHATGPT_API_KEY") or "EMPTY"
+    client = AsyncOpenAI(base_url=resolved_base, api_key=key) if resolved_base else AsyncOpenAI(api_key=key)
+
+    extra: dict = {}
+    if provider == "vllm":
+        # Keep synthesis non-thinking by default for the same reason the tool
+        # loop does (qwen3 reasoning-parser can blank `content`).
+        extra["extra_body"] = {
+            "chat_template_kwargs": {"enable_thinking": _env_truthy("PAGEINDEX_RETRIEVE_ENABLE_THINKING", False)}
+        }
+    kwargs = {"max_tokens": max_tokens} if max_tokens > 0 else {}
+    resp = await client.chat.completions.create(
+        model=model, messages=messages, temperature=0, **kwargs, **extra
+    )
+    msg = resp.choices[0].message
+    content = (msg.content or "").strip()
+    if not content:  # vLLM reasoning-parser fallback
+        content = (
+            getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None) or ""
+        ).strip()
+    return content
+
+
+def _assemble_evidence(store, candidates: list[dict]) -> tuple[str, list[dict]]:
+    """Fetch node text for the top candidates and concatenate into a budgeted
+    evidence block. Returns (evidence_text, used_candidates)."""
+    node_cap = _env_int("PAGEINDEX_FAST_NODE_MAX_CHARS", 8000)
+    total_cap = _env_int("PAGEINDEX_FAST_EVIDENCE_MAX_CHARS", 60000)
+    blocks: list[str] = []
+    used: list[dict] = []
+    total = 0
+    for cand in candidates:
+        content = store.get_node_content(cand["doc_id"], cand["node_id"])
+        text = content.get("text", "") or ""
+        if node_cap > 0 and len(text) > node_cap:
+            text = text[:node_cap].rstrip() + "..."
+        header = (
+            f"[doc_id={content['doc_id']} node_id={content['node_id']} "
+            f"title={content.get('title', '')!r} breadcrumb={content.get('breadcrumb', '')!r} "
+            f"source={content.get('source', '')}]"
+        )
+        block = f"{header}\n{text}"
+        if total_cap > 0 and total + len(block) > total_cap and blocks:
+            break
+        blocks.append(block)
+        used.append(cand)
+        total += len(block)
+    return "\n\n".join(blocks), used
+
+
+FAST_SYSTEM_PROMPT = (
+    "You are PageIndex, a local document QA assistant. Answer using ONLY the evidence "
+    "excerpts provided below, which may come from MULTIPLE documents. Give a thorough, "
+    "well-structured answer: explain the key evidence, important caveats, and how it "
+    "supports your conclusion. Cite the doc_id and node_id for each major claim, and when "
+    "the evidence spans multiple documents draw on all of the relevant ones. If the "
+    "evidence is insufficient to answer, say so explicitly rather than guessing."
+)
+
+
+def run_fast(
+    store,
+    model: str,
+    question: str,
+    verbose: bool = False,
+    provider: str = "auto",
+    base_url: str | None = None,
+    api_key: str | None = None,
+) -> str:
+    """One-shot retrieval: global BM25 select -> fetch top-K by key -> single
+    synthesis LLM call. No agent loop, no per-doc tree walk."""
+    provider, bare_model = resolve_provider(model, provider)
+    resolved_base = base_url or DEFAULT_BASE_URLS.get(provider)
+    logger.info("fast mode: provider=%s model=%s", provider, bare_model)
+    logger.info("question: %s", question)
+
+    pool = _env_int("PAGEINDEX_FAST_POOL", 50)
+    top_k = _env_int("PAGEINDEX_FAST_TOP_K", 8)
+    candidates = store.search(question, top_k=pool)
+    # Optional diversification: a single BM25 ranking over a multi-topic question
+    # can be monopolized by the strongest topic's document, hiding evidence in
+    # other docs. Capping nodes-per-doc (drawn from the larger pool) surfaces
+    # cross-document evidence. Default 0 = unlimited (faithful BM25 ranking).
+    max_per_doc = _env_int("PAGEINDEX_FAST_MAX_PER_DOC", 0)
+    if max_per_doc > 0:
+        capped: list[dict] = []
+        per_doc: dict[str, int] = {}
+        for c in candidates:
+            d = c["doc_id"]
+            if per_doc.get(d, 0) >= max_per_doc:
+                continue
+            per_doc[d] = per_doc.get(d, 0) + 1
+            capped.append(c)
+        candidates = capped
+    candidates = candidates[:top_k]
+    if not candidates:
+        return "[No candidates matched the query in the index. Try rephrasing the question.]"
+
+    print(f"\n[fast] {len(candidates)} candidate node(s) selected across documents:")
+    for c in candidates:
+        print(f"  - {c['doc_id']}  node={c['node_id']}  bm25={c['score']:.2f}  {c['title'][:70]!r}")
+        logger.info("fast candidate: %s/%s score=%.3f %r", c["doc_id"], c["node_id"], c["score"], c["title"])
+
+    evidence, used = _assemble_evidence(store, candidates)
+    logger.info("fast evidence: %d node(s), %d chars", len(used), len(evidence))
+    if verbose:
+        print(f"\n[fast] assembled evidence from {len(used)} node(s), {len(evidence)} chars")
+
+    user = f"Question:\n{question}\n\nEvidence:\n{evidence}"
+    max_tokens = _env_int("PAGEINDEX_FAST_MAX_TOKENS", 2048)
+
+    async def _run():
+        return await _synthesize_answer(
+            provider, bare_model, resolved_base, api_key,
+            FAST_SYSTEM_PROMPT, user, max_tokens,
+        )
+
+    try:
+        asyncio.get_running_loop()
+        in_loop = True
+    except RuntimeError:
+        in_loop = False
+    if in_loop:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool_exec:
+            answer = pool_exec.submit(asyncio.run, _run()).result()
+    else:
+        answer = asyncio.run(_run())
+    logger.info("fast final answer (%d chars): %s", len(answer), answer)
+    return answer
 
 
 async def _refine_vllm_answer_with_thinking(
@@ -945,6 +1149,8 @@ def query_agent(
     provider: str = "auto",
     base_url: str | None = None,
     api_key: str | None = None,
+    store=None,
+    seed_candidates: list[dict] | None = None,
 ) -> str:
     try:
         from agents import Agent, Runner, RunConfig, function_tool, set_tracing_disabled
@@ -1023,6 +1229,31 @@ def query_agent(
         )
 
     @function_tool
+    def search_all_documents(query: str, top_k: int = 10) -> str:
+        """Search across ALL indexed documents at once (BM25, vectorless).
+
+        Returns ranked candidates spanning the whole corpus, each with doc_id,
+        node_id, title, breadcrumb, and a short summary preview. Use this FIRST
+        for questions that may draw on more than one document, or when you don't
+        yet know which document holds the answer; then fetch promising nodes
+        with get_node_content(doc_id, node_id)."""
+        if store is None:
+            return json.dumps({'error': 'index unavailable; cross-doc search disabled'})
+        summary_cap = _env_int("PAGEINDEX_STRUCTURE_SUMMARY_MAX_CHARS", 160)
+        results = []
+        for c in store.search(query, top_k=top_k):
+            results.append({
+                'doc_id': c['doc_id'],
+                'node_id': c['node_id'],
+                'title': c.get('title', ''),
+                'breadcrumb': c.get('breadcrumb', ''),
+                'summary': _truncate_text(c.get('summary'), summary_cap),
+                'score': round(c.get('score', 0.0), 3),
+            })
+        logger.info("tool: search_all_documents(query=%r) -> %d hits", query, len(results))
+        return json.dumps({'query': query, 'results': results}, ensure_ascii=False)
+
+    @function_tool
     def answer(answer: str) -> str:
         """Return a thorough final answer to the user after document evidence has been gathered."""
         return answer
@@ -1050,10 +1281,14 @@ def query_agent(
             _max_out if _max_out > 0 else "server-default",
         )
 
+    tools = [list_documents, get_document, get_document_structure, get_node_content]
+    if store is not None:
+        tools.append(search_all_documents)
+    tools.append(answer)
     agent_kwargs = dict(
         name="PageIndexLocal",
         instructions=AGENT_SYSTEM_PROMPT,
-        tools=[list_documents, get_document, get_document_structure, get_node_content, answer],
+        tools=tools,
         tool_use_behavior={"stop_at_tool_names": ["answer"]},
         model=agent_model,
     )
@@ -1083,8 +1318,26 @@ def query_agent(
             call_model_input_filter=_make_structure_history_compactor(),
             tracing_disabled=True,
         )
+        agent_input = question
+        if seed_candidates:
+            summary_cap = _env_int("PAGEINDEX_STRUCTURE_SUMMARY_MAX_CHARS", 160)
+            lines = []
+            for c in seed_candidates:
+                lines.append(
+                    f"- doc_id={c['doc_id']} node_id={c['node_id']} "
+                    f"title={c.get('title', '')!r} breadcrumb={c.get('breadcrumb', '')!r}"
+                    + (f" summary={_truncate_text(c.get('summary'), summary_cap)!r}" if c.get('summary') else "")
+                )
+            seed_block = (
+                "Pre-retrieved candidate nodes from a cross-document BM25 search "
+                "(these span multiple documents; treat them as a starting point, "
+                "verify with get_node_content, and search_all_documents for more if needed):\n"
+                + "\n".join(lines)
+            )
+            agent_input = f"{question}\n\n{seed_block}"
+            logger.info("hybrid seed: injected %d candidate(s) into agent input", len(seed_candidates))
         streamed_run = Runner.run_streamed(
-            agent, question, max_turns=_max_turns, run_config=run_config,
+            agent, agent_input, max_turns=_max_turns, run_config=run_config,
         )
         current_kind = None
         tool_outputs_for_refine = []
@@ -1187,6 +1440,15 @@ def main():
                         help="Folder containing PageIndex tree JSON files.")
     parser.add_argument("--question", required=True,
                         help="Question to answer.")
+    parser.add_argument("--mode", default="hybrid",
+                        choices=["hybrid", "fast", "agent"],
+                        help="Retrieval strategy. 'fast': one-shot BM25 select + single "
+                             "synthesis call (fastest, cross-doc). 'agent': iterative tree "
+                             "walk + cross-doc search tool. 'hybrid' (default): BM25 candidates "
+                             "seed the agent, which can drill/verify for multi-hop reasoning.")
+    parser.add_argument("--db", default=None,
+                        help="Index DB path (default: <folder>/.pageindex_index.db). "
+                             "Refreshed incrementally at startup for fast/hybrid/agent modes.")
     parser.add_argument("--model", default=None,
                         help="LLM model (overrides config.yaml retrieve_model/model). "
                              "Prefix with ollama/, vllm/, openai/, or litellm/ for auto-detect.")
@@ -1216,16 +1478,19 @@ def main():
     if not folder.is_dir():
         raise SystemExit(f"Folder not found: {folder}")
 
-    documents = load_documents(folder)
-    if not documents:
-        raise SystemExit(f"No usable JSON tree files found in {folder}")
+    mode = args.mode
 
-    print(f"Loaded {len(documents)} document(s) from {folder}:")
-    for doc_id, doc in documents.items():
-        size = doc.get('page_count') if doc['type'] == 'pdf' else doc.get('line_count')
-        unit = "pages" if doc['type'] == 'pdf' else "lines"
-        print(f"  - {doc_id}  [{doc['type']}, {size} {unit}]  {doc.get('doc_name', '')}")
-    print()
+    # Open + incrementally refresh the SQLite index. fast/hybrid require it;
+    # agent mode uses it (when present) for the cross-doc search tool.
+    store = _open_index_for_folder(folder, args.db)
+    if mode in ("fast", "hybrid") and store is None:
+        if mode == "fast":
+            raise SystemExit(
+                f"Fast mode needs the SQLite index but it couldn't be built from {folder}. "
+                f"Check the folder has *_structure.json trees, or run build_index.py."
+            )
+        logger.warning("hybrid mode requested but index unavailable; falling back to agent mode")
+        mode = "agent"
 
     # Resolve model: explicit --model wins, then config retrieve_model, then config model.
     if args.model:
@@ -1233,6 +1498,24 @@ def main():
     else:
         opt = ConfigLoader().load(None)
         model = getattr(opt, 'retrieve_model', None) or opt.model
+
+    # fast mode answers straight from the index — no need to parse every tree
+    # into memory (the loading wall we're avoiding). agent/hybrid still need the
+    # in-memory trees for get_document_structure / get_node_content.
+    documents = {}
+    if mode in ("agent", "hybrid"):
+        documents = load_documents(folder)
+        if not documents:
+            raise SystemExit(f"No usable JSON tree files found in {folder}")
+        print(f"Loaded {len(documents)} document(s) from {folder}:")
+        for doc_id, doc in documents.items():
+            size = doc.get('page_count') if doc['type'] == 'pdf' else doc.get('line_count')
+            unit = "pages" if doc['type'] == 'pdf' else "lines"
+            print(f"  - {doc_id}  [{doc['type']}, {size} {unit}]  {doc.get('doc_name', '')}")
+        print()
+    elif store is not None:
+        stats = store.stats()
+        print(f"Indexed {stats['documents']} document(s), {stats['nodes']} node(s) from {folder}\n")
 
     # Provider-aware preflight: only require OpenAI key when targeting hosted OpenAI.
     provider, _ = resolve_provider(model, args.provider)
@@ -1246,21 +1529,44 @@ def main():
                 "For local models, use --provider vllm|ollama|litellm."
             )
 
+    print(f"Mode: {mode}")
     print(f"Question: {args.question}\n")
+    logger.info("mode=%s", mode)
 
     try:
-        answer = query_agent(
-            documents,
-            model,
-            args.question,
-            verbose=args.verbose,
-            provider=args.provider,
-            base_url=base_url,
-            api_key=args.api_key,
-        )
+        if mode == "fast":
+            answer = run_fast(
+                store,
+                model,
+                args.question,
+                verbose=args.verbose,
+                provider=args.provider,
+                base_url=base_url,
+                api_key=args.api_key,
+            )
+        else:
+            seed_candidates = None
+            if mode == "hybrid" and store is not None:
+                seed_k = _env_int("PAGEINDEX_HYBRID_SEED_K", 12)
+                seed_candidates = store.search(args.question, top_k=seed_k)
+                print(f"[hybrid] seeded agent with {len(seed_candidates)} cross-doc candidate(s)\n")
+            answer = query_agent(
+                documents,
+                model,
+                args.question,
+                verbose=args.verbose,
+                provider=args.provider,
+                base_url=base_url,
+                api_key=args.api_key,
+                store=store,
+                seed_candidates=seed_candidates,
+            )
     except Exception:
-        logger.exception("query_agent failed")
+        logger.exception("retrieval failed (mode=%s)", mode)
         raise
+    finally:
+        if store is not None:
+            store.close()
     print("\n" + "=" * 60)
     print("Final answer:")
     print("=" * 60)
