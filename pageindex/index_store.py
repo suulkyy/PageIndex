@@ -103,6 +103,9 @@ class IndexStore:
         # tool calls are already serial (parallel_tool_calls=False) and reads are
         # idempotent, so contention is nil.
         self._lock = threading.RLock()
+        # Cached (rowids, L2-normalized matrix) for brute-force cosine; built
+        # lazily, invalidated whenever embeddings change.
+        self._vec_cache: tuple | None = None
 
     # -- connection / schema --------------------------------------------------
 
@@ -163,6 +166,12 @@ class IndexStore:
                 title, breadcrumb, summary, text,
                 doc_id UNINDEXED,
                 node_rowid UNINDEXED
+            );
+
+            CREATE TABLE IF NOT EXISTS node_embeddings (
+                node_rowid INTEGER PRIMARY KEY,
+                dim        INTEGER,
+                vec        BLOB
             );
 
             CREATE TABLE IF NOT EXISTS file_manifest (
@@ -288,6 +297,13 @@ class IndexStore:
 
     @staticmethod
     def _delete_doc(conn: sqlite3.Connection, doc_id: str):
+        # Drop embeddings for this doc's nodes first (FK by node_rowid), since
+        # rebuilding reassigns rowids and would otherwise orphan stale vectors.
+        conn.execute(
+            "DELETE FROM node_embeddings WHERE node_rowid IN "
+            "(SELECT node_rowid FROM nodes WHERE doc_id=?)",
+            (doc_id,),
+        )
         conn.execute("DELETE FROM nodes_fts WHERE doc_id=?", (doc_id,))
         conn.execute("DELETE FROM nodes WHERE doc_id=?", (doc_id,))
         conn.execute("DELETE FROM documents WHERE doc_id=?", (doc_id,))
@@ -449,3 +465,171 @@ class IndexStore:
             "source": source,
             "text": text,
         }
+
+    # -- embeddings / vector search (Phase 2) ---------------------------------
+
+    def has_embeddings(self) -> bool:
+        with self._lock:
+            return self.conn.execute("SELECT COUNT(*) FROM node_embeddings").fetchone()[0] > 0
+
+    def embedding_meta(self) -> dict | None:
+        with self._lock:
+            rows = {
+                r["key"]: r["value"]
+                for r in self.conn.execute(
+                    "SELECT key, value FROM index_meta WHERE key IN ('embed_model', 'embed_dim')"
+                )
+            }
+        if not rows:
+            return None
+        return {
+            "model": rows.get("embed_model"),
+            "dim": int(rows["embed_dim"]) if rows.get("embed_dim") else None,
+        }
+
+    @staticmethod
+    def _embed_text(row) -> str:
+        parts = [row["title"], row["breadcrumb"], row["summary"]]
+        return "\n".join(p for p in parts if p) or (row["title"] or "")
+
+    def build_embeddings(self, embed_fn, reembed: bool = False, model_name: str | None = None) -> dict:
+        """Compute + store node embeddings. ``embed_fn`` maps list[str] ->
+        list[list[float]]. Incremental: embeds only nodes lacking a vector
+        unless ``reembed``. Embedding text is title + breadcrumb + summary.
+
+        Raises if a re-embed would mix dims with an existing model (use
+        ``reembed=True`` after an embedding-model change, mirroring LightRAG's
+        rule that switching embedding models requires recreating vectors)."""
+        import numpy as np
+
+        with self._lock:
+            conn = self.conn
+            if reembed:
+                conn.execute("DELETE FROM node_embeddings")
+                conn.execute("DELETE FROM index_meta WHERE key IN ('embed_model', 'embed_dim')")
+                conn.commit()
+                self._vec_cache = None
+            rows = conn.execute(
+                "SELECT n.node_rowid, n.title, n.breadcrumb, n.summary "
+                "FROM nodes n LEFT JOIN node_embeddings e ON e.node_rowid = n.node_rowid "
+                "WHERE e.node_rowid IS NULL"
+            ).fetchall()
+            existing = self.embedding_meta()
+
+        if not rows:
+            meta = self.embedding_meta() or {}
+            return {"embedded": 0, "dim": meta.get("dim"), "total": self._embedding_count()}
+
+        rowids = [r["node_rowid"] for r in rows]
+        texts = [self._embed_text(r) for r in rows]
+        vectors = embed_fn(texts)
+        if not vectors or len(vectors) != len(rowids):
+            raise RuntimeError(f"embed_fn returned {len(vectors) if vectors else 0} vectors for {len(rowids)} nodes")
+        dim = len(vectors[0])
+        if existing and existing.get("dim") and existing["dim"] != dim:
+            raise ValueError(
+                f"embedding dim mismatch: index has {existing['dim']}, new vectors are {dim}. "
+                f"Re-embed with reembed=True after changing the embedding model."
+            )
+
+        with self._lock:
+            conn = self.conn
+            conn.executemany(
+                "INSERT OR REPLACE INTO node_embeddings(node_rowid, dim, vec) VALUES(?,?,?)",
+                [
+                    (rid, dim, np.asarray(vec, dtype=np.float32).tobytes())
+                    for rid, vec in zip(rowids, vectors)
+                ],
+            )
+            conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES('embed_dim', ?)", (str(dim),))
+            if model_name:
+                conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES('embed_model', ?)", (model_name,))
+            conn.commit()
+            self._vec_cache = None
+
+        result = {"embedded": len(rowids), "dim": dim, "total": self._embedding_count()}
+        logger.info("build_embeddings: %s", result)
+        return result
+
+    def _embedding_count(self) -> int:
+        with self._lock:
+            return self.conn.execute("SELECT COUNT(*) FROM node_embeddings").fetchone()[0]
+
+    def _load_vector_cache(self):
+        with self._lock:
+            if self._vec_cache is not None:
+                return self._vec_cache
+            rows = self.conn.execute("SELECT node_rowid, dim, vec FROM node_embeddings").fetchall()
+        if not rows:
+            return None
+        import numpy as np
+
+        dim = rows[0]["dim"]
+        rowids = np.empty(len(rows), dtype=np.int64)
+        mat = np.empty((len(rows), dim), dtype=np.float32)
+        n = 0
+        for r in rows:
+            v = np.frombuffer(r["vec"], dtype=np.float32)
+            if len(v) != dim:  # guard against a stray mixed-dim row
+                continue
+            rowids[n] = r["node_rowid"]
+            mat[n] = v
+            n += 1
+        rowids, mat = rowids[:n], mat[:n]
+        norms = np.linalg.norm(mat, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        mat = mat / norms
+        with self._lock:
+            self._vec_cache = (rowids, mat)
+        return self._vec_cache
+
+    def vector_search(self, query_vec, top_k: int = 50) -> list[dict]:
+        """Brute-force cosine search over stored node embeddings. Returns the
+        same candidate-dict shape as ``search`` but with ``score`` = cosine
+        similarity (higher = better). Empty list when no embeddings exist or the
+        query dim doesn't match the index (caller should fall back to BM25)."""
+        import numpy as np
+
+        cache = self._load_vector_cache()
+        if cache is None:
+            return []
+        rowids, mat = cache
+        q = np.asarray(query_vec, dtype=np.float32)
+        if q.shape[0] != mat.shape[1]:
+            logger.warning("query embedding dim %d != index dim %d; skipping vector search", q.shape[0], mat.shape[1])
+            return []
+        qn = np.linalg.norm(q)
+        if qn == 0:
+            return []
+        sims = mat @ (q / qn)
+        k = min(top_k, sims.shape[0])
+        if k <= 0:
+            return []
+        part = np.argpartition(-sims, k - 1)[:k]
+        order = part[np.argsort(-sims[part])]
+        scored = [(int(rowids[i]), float(sims[i])) for i in order]
+        return self._rows_for_rowids(scored)
+
+    def _rows_for_rowids(self, scored: list[tuple[int, float]]) -> list[dict]:
+        if not scored:
+            return []
+        ids = [rid for rid, _ in scored]
+        placeholders = ",".join("?" * len(ids))
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT node_rowid, doc_id, node_id, title, breadcrumb, summary, "
+                f"start_index, end_index, line_num, text_len "
+                f"FROM nodes WHERE node_rowid IN ({placeholders})",
+                ids,
+            ).fetchall()
+        by_id = {r["node_rowid"]: r for r in rows}
+        out = []
+        for rid, s in scored:
+            r = by_id.get(rid)
+            if r is None:
+                continue
+            d = dict(r)
+            d.pop("node_rowid", None)
+            d["score"] = s
+            out.append(d)
+        return out

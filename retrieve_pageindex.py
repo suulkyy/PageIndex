@@ -976,6 +976,92 @@ def _assemble_evidence(store, candidates: list[dict]) -> tuple[str, list[dict]]:
     return "\n\n".join(blocks), used
 
 
+def _rrf_fuse(result_lists: list[list[dict]], k: int = 60) -> list[dict]:
+    """Reciprocal-rank fusion of several ranked candidate lists. Each candidate
+    is keyed by (doc_id, node_id); its fused score is sum 1/(k + rank). Score
+    sign/scale across lists is irrelevant — only rank position matters — so this
+    cleanly combines BM25 (lower=better) with cosine (higher=better)."""
+    scores: dict[tuple, float] = {}
+    first_seen: dict[tuple, dict] = {}
+    sources: dict[tuple, set] = {}
+    for li, lst in enumerate(result_lists):
+        for rank, cand in enumerate(lst):
+            key = (cand.get("doc_id"), cand.get("node_id"))
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+            sources.setdefault(key, set()).add(li)
+            first_seen.setdefault(key, cand)
+    fused = sorted(first_seen.values(),
+                   key=lambda c: scores[(c.get("doc_id"), c.get("node_id"))], reverse=True)
+    for c in fused:
+        key = (c.get("doc_id"), c.get("node_id"))
+        c["rrf"] = round(scores[key], 6)
+        c["match_sources"] = sorted(sources[key])
+    return fused
+
+
+def _rerank_candidates(store, question: str, candidates: list[dict]) -> list[dict] | None:
+    """Reorder candidates with the cross-encoder reranker (:8002). Reranks on
+    title + breadcrumb + node text head (capped). Returns None on failure so the
+    caller keeps the pre-rerank order."""
+    if not candidates:
+        return candidates
+    try:
+        from pageindex import semantic
+    except ImportError:
+        return None
+    doc_cap = _env_int("PAGEINDEX_RERANK_DOC_MAX_CHARS", 2000)
+    docs = []
+    for c in candidates:
+        node = store.get_node_content(c["doc_id"], c["node_id"])
+        body = node.get("text") or c.get("summary") or ""
+        head = f"{c.get('title', '')} {c.get('breadcrumb', '')}\n{body}".strip()
+        docs.append(head[:doc_cap] if doc_cap > 0 else head)
+    order = semantic.rerank(question, docs, top_k=len(docs))
+    if order is None:
+        return None
+    reranked = [candidates[i] for i, _ in order if 0 <= i < len(candidates)]
+    for c, (_, s) in zip(reranked, order):
+        c["rerank"] = round(float(s), 6)
+    return reranked
+
+
+def _hybrid_select(store, question: str, pool: int, retriever: str = "auto",
+                   rerank_enabled: bool = False, verbose: bool = False) -> tuple[list[dict], str]:
+    """Select candidates across all docs. retriever: auto|bm25|vector|hybrid.
+    'auto' = hybrid when embeddings exist, else bm25. Optionally rerank the
+    fused pool. Returns (candidates, retriever_used)."""
+    bm25 = store.search(question, top_k=pool)
+    has_vec = store.has_embeddings()
+    want_vector = retriever in ("auto", "hybrid", "vector") and has_vec
+    vector: list[dict] = []
+    if want_vector:
+        try:
+            from pageindex import semantic
+            qvec = semantic.embed_query(question)
+            vector = store.vector_search(qvec, top_k=pool)
+        except Exception:
+            logger.exception("query embedding/vector search failed; falling back to BM25")
+            want_vector = False
+
+    if retriever == "bm25" or (not want_vector and retriever != "vector"):
+        candidates, used = bm25, "bm25"
+    elif retriever == "vector":
+        candidates, used = (vector or bm25), ("vector" if vector else "bm25")
+    else:  # auto / hybrid
+        candidates, used = _rrf_fuse([bm25, vector]), "hybrid"
+
+    if rerank_enabled and candidates:
+        reranked = _rerank_candidates(store, question, candidates[:pool])
+        if reranked is not None:
+            candidates, used = reranked, f"{used}+rerank"
+        else:
+            logger.warning("rerank unavailable; keeping %s order", used)
+    if verbose:
+        logger.info("retriever=%s bm25=%d vector=%d -> %d candidates",
+                    used, len(bm25), len(vector), len(candidates))
+    return candidates, used
+
+
 FAST_SYSTEM_PROMPT = (
     "You are PageIndex, a local document QA assistant. Answer using ONLY the evidence "
     "excerpts provided below, which may come from MULTIPLE documents. Give a thorough, "
@@ -1004,7 +1090,13 @@ def run_fast(
 
     pool = _env_int("PAGEINDEX_FAST_POOL", 50)
     top_k = _env_int("PAGEINDEX_FAST_TOP_K", 8)
-    candidates = store.search(question, top_k=pool)
+    retriever = os.getenv("PAGEINDEX_FAST_RETRIEVER", "auto")
+    rerank_enabled = _env_truthy("PAGEINDEX_RERANK", False)
+    candidates, retriever_used = _hybrid_select(
+        store, question, pool, retriever=retriever, rerank_enabled=rerank_enabled, verbose=verbose,
+    )
+    logger.info("fast retriever=%s (embeddings=%s)", retriever_used, store.has_embeddings())
+    print(f"[fast] retriever={retriever_used}")
     # Optional diversification: a single BM25 ranking over a multi-topic question
     # can be monopolized by the strongest topic's document, hiding evidence in
     # other docs. Capping nodes-per-doc (drawn from the larger pool) surfaces
@@ -1024,10 +1116,18 @@ def run_fast(
     if not candidates:
         return "[No candidates matched the query in the index. Try rephrasing the question.]"
 
+    def _cand_score(c: dict) -> str:
+        # Show the score that actually ordered this candidate: rerank > rrf > raw.
+        if "rerank" in c:
+            return f"rerank={c['rerank']:.3f}"
+        if "rrf" in c:
+            return f"rrf={c['rrf']:.4f}"
+        return f"score={c.get('score', 0.0):.2f}"
+
     print(f"\n[fast] {len(candidates)} candidate node(s) selected across documents:")
     for c in candidates:
-        print(f"  - {c['doc_id']}  node={c['node_id']}  bm25={c['score']:.2f}  {c['title'][:70]!r}")
-        logger.info("fast candidate: %s/%s score=%.3f %r", c["doc_id"], c["node_id"], c["score"], c["title"])
+        print(f"  - {c['doc_id']}  node={c['node_id']}  {_cand_score(c)}  {c['title'][:70]!r}")
+        logger.info("fast candidate: %s/%s %s %r", c["doc_id"], c["node_id"], _cand_score(c), c["title"])
 
     evidence, used = _assemble_evidence(store, candidates)
     logger.info("fast evidence: %d node(s), %d chars", len(used), len(evidence))
@@ -1240,8 +1340,14 @@ def query_agent(
         if store is None:
             return json.dumps({'error': 'index unavailable; cross-doc search disabled'})
         summary_cap = _env_int("PAGEINDEX_STRUCTURE_SUMMARY_MAX_CHARS", 160)
+        pool = max(top_k * 3, 30)
+        cands, used = _hybrid_select(
+            store, query, pool,
+            retriever=os.getenv("PAGEINDEX_FAST_RETRIEVER", "auto"),
+            rerank_enabled=False,
+        )
         results = []
-        for c in store.search(query, top_k=top_k):
+        for c in cands[:top_k]:
             results.append({
                 'doc_id': c['doc_id'],
                 'node_id': c['node_id'],
@@ -1250,8 +1356,8 @@ def query_agent(
                 'summary': _truncate_text(c.get('summary'), summary_cap),
                 'score': round(c.get('score', 0.0), 3),
             })
-        logger.info("tool: search_all_documents(query=%r) -> %d hits", query, len(results))
-        return json.dumps({'query': query, 'results': results}, ensure_ascii=False)
+        logger.info("tool: search_all_documents(query=%r, retriever=%s) -> %d hits", query, used, len(results))
+        return json.dumps({'query': query, 'retriever': used, 'results': results}, ensure_ascii=False)
 
     @function_tool
     def answer(answer: str) -> str:
