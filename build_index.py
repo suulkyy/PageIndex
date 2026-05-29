@@ -46,6 +46,10 @@ def main():
                         help="Embedding server base URL (default env PAGEINDEX_EMBED_BASE_URL or http://localhost:8001/v1).")
     parser.add_argument("--embed-model", default=None,
                         help="Embedding model name (default env PAGEINDEX_EMBED_MODEL or rag-embed).")
+    parser.add_argument("--embed-body-chars", type=int, default=1000,
+                        help="Chars of node body text appended to the embedded string (A1 semantic "
+                             "recall). Default 1000 (validated sweet spot); 0 = metadata only "
+                             "(title+breadcrumb+summary). Changing this requires --reembed.")
     parser.add_argument("--verbose", action="store_true",
                         help="Log per-document indexing progress.")
     args = parser.parse_args()
@@ -79,9 +83,11 @@ def main():
                     texts, base_url=args.embed_base_url, model=args.embed_model,
                 )
 
-            emb = store.build_embeddings(embed_fn, reembed=args.reembed, model_name=cfg["model"])
+            emb = store.build_embeddings(embed_fn, reembed=args.reembed, model_name=cfg["model"],
+                                         body_chars=args.embed_body_chars)
             print(
                 "Embeddings: {embedded} new, {total} total, dim={dim}".format(**emb)
+                + f", body_chars={args.embed_body_chars}"
             )
 
         stats = store.stats()

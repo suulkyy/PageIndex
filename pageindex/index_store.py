@@ -488,14 +488,26 @@ class IndexStore:
         }
 
     @staticmethod
-    def _embed_text(row) -> str:
+    def _embed_text(row, body_chars: int = 0) -> str:
+        """Text fed to the embedding model for a node. Always title + breadcrumb +
+        summary; when ``body_chars`` > 0, also append a head slice of the node's
+        body text so semantic recall isn't limited to metadata (A1). The body head
+        goes last so the higher-signal title/summary lead the (truncated) input."""
         parts = [row["title"], row["breadcrumb"], row["summary"]]
-        return "\n".join(p for p in parts if p) or (row["title"] or "")
+        base = "\n".join(p for p in parts if p)
+        if body_chars > 0:
+            keys = row.keys() if hasattr(row, "keys") else ()
+            body = (row["text"] if "text" in keys else "") or ""
+            if body:
+                base = (base + "\n" + body[:body_chars]).strip()
+        return base or (row["title"] or "")
 
-    def build_embeddings(self, embed_fn, reembed: bool = False, model_name: str | None = None) -> dict:
+    def build_embeddings(self, embed_fn, reembed: bool = False, model_name: str | None = None,
+                         body_chars: int = 0) -> dict:
         """Compute + store node embeddings. ``embed_fn`` maps list[str] ->
         list[list[float]]. Incremental: embeds only nodes lacking a vector
-        unless ``reembed``. Embedding text is title + breadcrumb + summary.
+        unless ``reembed``. Embedding text is title + breadcrumb + summary, plus a
+        ``body_chars``-char head of the node body when > 0 (A1 semantic recall).
 
         Raises if a re-embed would mix dims with an existing model (use
         ``reembed=True`` after an embedding-model change, mirroring LightRAG's
@@ -506,11 +518,11 @@ class IndexStore:
             conn = self.conn
             if reembed:
                 conn.execute("DELETE FROM node_embeddings")
-                conn.execute("DELETE FROM index_meta WHERE key IN ('embed_model', 'embed_dim')")
+                conn.execute("DELETE FROM index_meta WHERE key IN ('embed_model', 'embed_dim', 'embed_body_chars')")
                 conn.commit()
                 self._vec_cache = None
             rows = conn.execute(
-                "SELECT n.node_rowid, n.title, n.breadcrumb, n.summary "
+                "SELECT n.node_rowid, n.title, n.breadcrumb, n.summary, n.text "
                 "FROM nodes n LEFT JOIN node_embeddings e ON e.node_rowid = n.node_rowid "
                 "WHERE e.node_rowid IS NULL"
             ).fetchall()
@@ -521,7 +533,7 @@ class IndexStore:
             return {"embedded": 0, "dim": meta.get("dim"), "total": self._embedding_count()}
 
         rowids = [r["node_rowid"] for r in rows]
-        texts = [self._embed_text(r) for r in rows]
+        texts = [self._embed_text(r, body_chars) for r in rows]
         vectors = embed_fn(texts)
         if not vectors or len(vectors) != len(rowids):
             raise RuntimeError(f"embed_fn returned {len(vectors) if vectors else 0} vectors for {len(rowids)} nodes")
@@ -542,6 +554,7 @@ class IndexStore:
                 ],
             )
             conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES('embed_dim', ?)", (str(dim),))
+            conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES('embed_body_chars', ?)", (str(body_chars),))
             if model_name:
                 conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES('embed_model', ?)", (model_name,))
             conn.commit()
