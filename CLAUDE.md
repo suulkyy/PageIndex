@@ -8,11 +8,10 @@ PageIndex builds a hierarchical "table-of-contents" tree from long PDFs (or Mark
 
 ## Repo layout (tracked files only)
 
-- Top level: `run_pageindex.py`, `run_pageindex_verbose.py`, `retrieve_pageindex.py`, `build_index.py`, `pyproject.toml`, `requirements.txt`, `LICENSE`, `README.md`, `AGENTS.md`, `CLAUDE.md`.
-- `pageindex/` package: `page_index.py` (PDF pipeline), `page_index_md.py` (Markdown pipeline), `utils.py` (LLM layer, config loader, helpers), `retrieve.py` + `client.py` (programmatic retrieval), `index_store.py` (persistent SQLite/BM25+vector index for fast & cross-doc retrieval), `semantic.py` (embedding + rerank HTTP clients for the optional Phase-2 semantic layer), `config.yaml` (defaults), `__init__.py`.
-- `cookbook/` notebooks: `pageindex_RAG_simple.ipynb`, `vision_RAG_pageindex.ipynb`, `agentic_retrieval.ipynb`, `pageIndex_chat_quickstart.ipynb`, `README.md`.
-- `examples/` — `agentic_vectorless_rag_demo.py`, `documents/` (sample PDFs + pre-built `_structure.json` outputs under `documents/results/`), `tutorials/doc-search/`, `tutorials/tree-search/`, `workspace/` (sample workspace dump used by `PageIndexClient`).
-- `.github/` — workflows for CodeQL, dependency review, and issue dedupe (`autoclose-labeled-issues`, `backfill-dedupe`, `issue-dedupe`, `remove-autoclose-label`); `.claude/commands/dedupe.md` is the dedupe agent prompt.
+- Top level: `run_pageindex_verbose.py`, `retrieve_pageindex.py`, `build_index.py`, `pyproject.toml`, `requirements.txt`, `LICENSE`, `README.md`, `AGENTS.md`, `CLAUDE.md`.
+- `pageindex/` package: `page_index.py` (PDF pipeline), `page_index_md.py` (Markdown pipeline), `utils.py` (LLM layer, config loader, helpers), `index_store.py` (persistent SQLite/BM25+vector index for fast & cross-doc retrieval), `semantic.py` (embedding + rerank HTTP clients for the optional Phase-2 semantic layer), `config.yaml` (defaults), `__init__.py`.
+- `examples/` — `documents/` (sample PDFs + pre-built `_structure.json` outputs under `documents/results/`), `tutorials/doc-search/`, `tutorials/tree-search/`.
+- `.github/` — workflows for CodeQL (`codeql`) and dependency review (`dependency-review`).
 
 ## Setup
 
@@ -64,7 +63,7 @@ Key points vs older Qwen3.5-9B recipe:
 Sample `.env`:
 
 ```bash
-# ─── Tree-build (run_pageindex.py / run_pageindex_verbose.py) ──────────────
+# ─── Tree-build (run_pageindex_verbose.py) ─────────────────────────────────
 VLLM_API_BASE=http://<VLLM_HOST>:8000/v1
 VLLM_TIMEOUT=3600
 PAGEINDEX_LLM_CONCURRENCY=8                  # match remote --max-num-seqs 8 to avoid KV preemption
@@ -96,7 +95,7 @@ PAGEINDEX_RETRIEVE_ENABLE_THINKING=false
 PAGEINDEX_AGENT_MAX_TOKENS=2048
 ```
 
-Pass `--model hosted_vllm/rag-llm` to `run_pageindex.py` and `--provider vllm --model rag-llm` to `retrieve_pageindex.py` — both pick up the URL from `.env` so no `--base-url` is needed.
+Pass `--model hosted_vllm/rag-llm` to `run_pageindex_verbose.py` and `--provider vllm --model rag-llm` to `retrieve_pageindex.py` — both pick up the URL from `.env` so no `--base-url` is needed.
 
 Two-name gotcha: `VLLM_API_BASE` is read by the **tree-build** path (`pageindex/utils.py:_provider_kwargs`), `VLLM_BASE_URL` (with `/v1`) is read by the **retrieval** path (`retrieve_pageindex.py`). Set both to the same URL so either script works without `--base-url`.
 
@@ -104,12 +103,12 @@ Two-name gotcha: `VLLM_API_BASE` is read by the **tree-build** path (`pageindex/
 
 ### Tree generation
 ```bash
-python3 run_pageindex.py --pdf_path path/to/doc.pdf
-python3 run_pageindex.py --md_path  path/to/doc.md
+python3 run_pageindex_verbose.py --pdf_path path/to/doc.pdf
+python3 run_pageindex_verbose.py --md_path  path/to/doc.md
 ```
 Output: `./results/<basename>_structure.json` (`results/` is created on first run; gitignored output dir). JSON logger writes per-doc trace to `./logs/` (also gitignored).
 
-Verbose variant streams phase timings + log previews to stderr (final save still on stdout):
+By default it also streams phase timings + log previews to stderr (final save still on stdout):
 ```bash
 python3 run_pageindex_verbose.py --pdf_path doc.pdf [--quiet] [--log-level DEBUG] [--log-file path]
 ```
@@ -118,8 +117,7 @@ Flags specific to the verbose script:
 - `--log-level` — python `logging` level (default `WARNING`); raise to `INFO`/`DEBUG` for litellm + asyncio chatter on stderr.
 - `--log-file` — override tee destination (default `./logs/run_<YYYYMMDD_HHMMSS>.log`). Pass `none` to disable. Both `sys.stdout` and `sys.stderr` are tee'd into this file, so the upstream `print(...)` calls (`Parsing PDF...`, TOC mode/accuracy chatter, final save line) and any tracebacks land in the log alongside the streamed JsonLogger previews. Bare lines get a `[YYYY-MM-DD HH:MM:SS.mmm]` prefix in the file copy; lines that already start with a timestamp (logger format, phase markers) pass through unchanged so timestamps don't double up. Terminal output is not modified.
 
-The verbose script delegates the actual pipeline to upstream `pageindex.page_index.page_index_main` (PDF) and `pageindex.page_index_md.md_to_tree` (MD) — same return shape, key ordering, and branching as `run_pageindex.py`. Verbose adds only: JsonLogger monkey-patch (live stderr previews), `_phase` timer around the whole PDF/MD pipeline + save, and the stdout/stderr tee.
-All other flags match `run_pageindex.py`.
+The script delegates the actual pipeline to `pageindex.page_index.page_index_main` (PDF) and `pageindex.page_index_md.md_to_tree` (MD) — it adds only: JsonLogger monkey-patch (live stderr previews), `_phase` timer around the whole PDF/MD pipeline + save, and the stdout/stderr tee. It honors the common/runtime flags documented below and replaces the upstream `run_pageindex.py` thin wrapper.
 
 Common flags (all override `pageindex/config.yaml`): `--model`, `--toc-check-pages`, `--toc-verify-sample`, `--max-pages-per-node`, `--max-tokens-per-node`, `--if-add-node-id yes|no`, `--if-add-node-summary`, `--if-add-doc-description`, `--if-add-node-text`. Markdown-only: `--if-thinning`, `--thinning-threshold`, `--summary-token-threshold`.
 
@@ -276,19 +274,8 @@ python3 retrieve_pageindex.py --folder ./results --question "..." \
 
 vllm/ollama paths build an `AsyncOpenAI` client + `OpenAIChatCompletionsModel` (Chat Completions, not Responses API) — agent streams reasoning + tool calls live regardless.
 
-### Agentic demo
-```bash
-python3 examples/agentic_vectorless_rag_demo.py
-```
-
-### Cookbook notebooks (`cookbook/`)
-- `pageindex_RAG_simple.ipynb` — minimal vectorless RAG walkthrough.
-- `vision_RAG_pageindex.ipynb` — page-image (no-OCR) reasoning RAG.
-- `agentic_retrieval.ipynb` — agent-driven retrieval over a built tree.
-- `pageIndex_chat_quickstart.ipynb` — chat-style quickstart on top of PageIndex output.
-
 ### Tests / lint
-None configured. No pytest, ruff, or CI test workflow. CI workflows under `.github/workflows/` are for CodeQL, dependency review, and issue dedupe — not project tests.
+None configured. No pytest, ruff, or CI test workflow. CI workflows under `.github/workflows/` are for CodeQL and dependency review — not project tests.
 
 ## Architecture
 
@@ -336,9 +323,6 @@ Runtime knobs that change the LLM layer (concurrency, vLLM/Ollama URLs, max-toke
 
 ### LLM layer (`pageindex/utils.py`)
 All LLM calls go through `llm_completion` / `llm_acompletion` — both wrap LiteLLM with `temperature=0`, retry up to 10× with 1s backoff, and strip a `litellm/` prefix before dispatch (LiteLLM picks provider from the rest of the string). `litellm.drop_params = True` — unsupported params silently dropped per provider. `extract_json` tolerates code fences and partial JSON when parsing model replies. Cleanup chain: (1) raw_decode of first valid JSON, (2) `json.loads` after newline/whitespace normalize, (3) trailing-comma strip + `json.loads`, (4) `json_repair.repair_json` final fallback (handles missing commas between objects like `}{`, unescaped quotes inside strings, single-quoted keys, unquoted keys, trailing commas — common Qwen3.5-9B malformations seen as `Expecting ',' delimiter: line 1 column N`).
-
-### Retrieval (`pageindex/retrieve.py`, `pageindex/client.py`)
-`retrieve.py` exposes 3 stateless tools over a `documents` dict: `get_document`, `get_document_structure` (text fields stripped), `get_page_content` (PDF: page nums; MD: line nums via `_get_md_page_content`). `client.py:PageIndexClient` is the user-facing wrapper — `index()` writes trees + cached page text into a workspace dir keyed by uuid; tools resolve through it. A sample workspace lives at `examples/workspace/` (`_meta.json` + uuid-keyed JSON) for hands-on exploration. `_normalize_retrieve_model` keeps `litellm/` and `openai/` as passthrough but rewrites bare `provider/model` to `litellm/provider/model` so the OpenAI Agents SDK routes via LiteLLM.
 
 ### Standalone retriever (`retrieve_pageindex.py`)
 Loads `*.json` from a folder, infers PDF vs MD per-file by node fields (`start_index` → pdf, `line_num` → md). Has three `--mode`s (default `hybrid`) all backed by a persistent SQLite index (see `### Index store` below): `fast` (one-shot BM25 → single synthesis call, no agent loop — `run_fast` + `_synthesize_answer` + `_assemble_evidence`), `agent` (the loop), and `hybrid` (BM25 candidates seed the agent input). `fast` mode never calls `load_documents`, so it sidesteps parsing every tree into RAM.

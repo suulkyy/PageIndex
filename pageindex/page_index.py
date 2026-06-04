@@ -154,81 +154,6 @@ def toc_detector_single_page(content, model=None):
     return json_content.get('toc_detected', 'no')
 
 
-def check_if_toc_extraction_is_complete(content, toc, model=None):
-    prompt = f"""
-    You are given a partial document  and a  table of contents.
-    Your job is to check if the  table of contents is complete, which it contains all the main sections in the partial document.
-
-    Reply format:
-    {{
-        "completed": "yes" or "no"
-    }}
-    Directly return the final JSON structure. Do not include explanations or any other text."""
-
-    prompt = prompt + '\n Document:\n' + content + '\n Table of contents:\n' + toc
-    response = llm_completion(model=model, prompt=prompt)
-    json_content = extract_json(response)
-    return json_content.get('completed', 'no')
-
-
-def check_if_toc_transformation_is_complete(content, toc, model=None):
-    prompt = f"""
-    You are given a raw table of contents and a  table of contents.
-    Your job is to check if the  table of contents is complete.
-
-    Reply format:
-    {{
-        "completed": "yes" or "no"
-    }}
-    Directly return the final JSON structure. Do not include explanations or any other text."""
-
-    prompt = prompt + '\n Raw Table of contents:\n' + content + '\n Cleaned Table of contents:\n' + toc
-    response = llm_completion(model=model, prompt=prompt)
-    json_content = extract_json(response)
-    return json_content.get('completed', 'no')
-
-def extract_toc_content(content, model=None):
-    prompt = f"""
-    Your job is to extract the full table of contents from the given text, replace ... with :
-
-    Given text: {content}
-
-    Directly return the full table of contents content. Do not output anything else."""
-
-    response, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
-    
-    if_complete = check_if_toc_transformation_is_complete(content, response, model)
-    if if_complete == "yes" and finish_reason == "finished":
-        return response
-    
-    chat_history = [
-        {"role": "user", "content": prompt}, 
-        {"role": "assistant", "content": response},    
-    ]
-    prompt = f"""please continue the generation of table of contents , directly output the remaining part of the structure"""
-    new_response, finish_reason = llm_completion(model=model, prompt=prompt, chat_history=chat_history, return_finish_reason=True)
-    response = response + new_response
-    if_complete = check_if_toc_transformation_is_complete(content, response, model)
-    
-    attempt = 0
-    max_attempts = 5
-
-    while not (if_complete == "yes" and finish_reason == "finished"):
-        attempt += 1
-        if attempt > max_attempts:
-            raise Exception('Failed to complete table of contents after maximum retries')
-
-        chat_history = [
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": response},
-        ]
-        prompt = f"""please continue the generation of table of contents , directly output the remaining part of the structure"""
-        new_response, finish_reason = llm_completion(model=model, prompt=prompt, chat_history=chat_history, return_finish_reason=True)
-        response = response + new_response
-        if_complete = check_if_toc_transformation_is_complete(content, response, model)
-    
-    return response
-
 def detect_page_index(toc_content, model=None):
     print('start detect_page_index')
     prompt = f"""
@@ -972,19 +897,6 @@ async def add_page_number_to_toc(part, structure, model=None, chunk_size=None, l
             orig['physical_index'] = phys
 
     return structure
-
-
-def remove_first_physical_index_section(text):
-    """
-    Removes the first section between <physical_index_X> and <physical_index_X> tags,
-    and returns the remaining text.
-    """
-    pattern = r'<physical_index_\d+>.*?<physical_index_\d+>'
-    match = re.search(pattern, text, re.DOTALL)
-    if match:
-        # Remove the first matched section
-        return text.replace(match.group(0), '', 1)
-    return text
 
 
 def _extract_complete_toc_items(content):

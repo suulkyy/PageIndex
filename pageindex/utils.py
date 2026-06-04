@@ -412,80 +412,6 @@ def get_leaf_nodes(structure):
             leaf_nodes.extend(get_leaf_nodes(item))
         return leaf_nodes
 
-def is_leaf_node(data, node_id):
-    # Helper function to find the node by its node_id
-    def find_node(data, node_id):
-        if isinstance(data, dict):
-            if data.get('node_id') == node_id:
-                return data
-            for key in data.keys():
-                if 'nodes' in key:
-                    result = find_node(data[key], node_id)
-                    if result:
-                        return result
-        elif isinstance(data, list):
-            for item in data:
-                result = find_node(item, node_id)
-                if result:
-                    return result
-        return None
-
-    # Find the node with the given node_id
-    node = find_node(data, node_id)
-
-    # Check if the node is a leaf node
-    if node and not node.get('nodes'):
-        return True
-    return False
-
-def get_last_node(structure):
-    return structure[-1]
-
-
-def extract_text_from_pdf(pdf_path):
-    pdf_reader = PyPDF2.PdfReader(pdf_path)
-    ###return text not list 
-    text=""
-    for page_num in range(len(pdf_reader.pages)):
-        page = pdf_reader.pages[page_num]
-        text+=page.extract_text()
-    return text
-
-def get_pdf_title(pdf_path):
-    pdf_reader = PyPDF2.PdfReader(pdf_path)
-    meta = pdf_reader.metadata
-    title = meta.title if meta and meta.title else 'Untitled'
-    return title
-
-def get_text_of_pages(pdf_path, start_page, end_page, tag=True):
-    pdf_reader = PyPDF2.PdfReader(pdf_path)
-    text = ""
-    for page_num in range(start_page-1, end_page):
-        page = pdf_reader.pages[page_num]
-        page_text = page.extract_text()
-        if tag:
-            text += f"<start_index_{page_num+1}>\n{page_text}\n<end_index_{page_num+1}>\n"
-        else:
-            text += page_text
-    return text
-
-def get_first_start_page_from_text(text):
-    start_page = -1
-    start_page_match = re.search(r'<start_index_(\d+)>', text)
-    if start_page_match:
-        start_page = int(start_page_match.group(1))
-    return start_page
-
-def get_last_start_page_from_text(text):
-    start_page = -1
-    # Find all matches of start_index tags
-    start_page_matches = re.finditer(r'<start_index_(\d+)>', text)
-    # Convert iterator to list and get the last match if any exist
-    matches_list = list(start_page_matches)
-    if matches_list:
-        start_page = int(matches_list[-1].group(1))
-    return start_page
-
 
 def sanitize_filename(filename, replacement='-'):
     # In Linux, only '/' and '\0' (null) are invalid in filenames.
@@ -778,18 +704,6 @@ def remove_structure_text(data):
         for item in data:
             remove_structure_text(item)
     return data
-
-
-def check_token_limit(structure, limit=110000):
-    list = structure_to_list(structure)
-    for node in list:
-        num_tokens = count_tokens(node['text'], model=None)
-        if num_tokens > limit:
-            print(f"Node ID: {node['node_id']} has {num_tokens} tokens")
-            print("Start Index:", node['start_index'])
-            print("End Index:", node['end_index'])
-            print("Title:", node['title'])
-            print("\n")
 
 
 def convert_physical_index_to_int(data):
